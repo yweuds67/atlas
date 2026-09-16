@@ -31,6 +31,10 @@
 
 </div>
 
+> This fork is for Yweuds to learn coding-agent source control tool use —
+> tracing how checkpoints tie each commit back to the session that produced it,
+> and how several agents share one memory while working the same codebase.
+
 Atlas is source control for coding agents. Every agent run produces checkpoints: commits are linked back to the session that made it alongside the prompts, tool calls, and reasoning. You see which agent did exactly what and why.
 
 Run Claude Code, Codex, Atlas's own agent, or anything from the ACP registry side by side against the same codebase, with shared memory so switching agents mid-task doesn't mean starting over.
