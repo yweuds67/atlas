@@ -160,7 +160,9 @@ impl Harness {
 }
 
 fn lock(thread: &AcpThreadHandle) -> std::sync::MutexGuard<'_, AcpThread> {
-    thread.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    thread
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 fn text_chunk(text: &str) -> serde_json::Value {
@@ -556,7 +558,9 @@ async fn rate_limits_are_announced_once_per_change() {
     lock(&harness.thread).update_rate_limits(Some(limits.clone()));
     harness.expect(1);
     match &harness.recorder.deltas()[0] {
-        SessionDelta::RateLimits { primary, plan_type, .. } => {
+        SessionDelta::RateLimits {
+            primary, plan_type, ..
+        } => {
             assert_eq!(primary.as_ref().map(|w| w.used_percent), Some(40));
             assert_eq!(plan_type.as_deref(), Some("plus"));
         }
@@ -564,7 +568,11 @@ async fn rate_limits_are_announced_once_per_change() {
     }
 
     lock(&harness.thread).update_rate_limits(Some(limits.clone()));
-    assert_eq!(harness.recorder.kinds().len(), 1, "an unchanged snapshot is silence");
+    assert_eq!(
+        harness.recorder.kinds().len(),
+        1,
+        "an unchanged snapshot is silence"
+    );
 
     let mut moved = limits;
     moved.primary.as_mut().expect("primary").used_percent = 55;
@@ -590,9 +598,11 @@ async fn a_cache_only_turn_still_counts_as_a_split() {
 async fn the_host_announces_what_the_thread_cannot() {
     let harness = Harness::start();
 
-    harness
-        .projector
-        .note_turn_failed(&harness.session_id, "the model refused", Some("auth".into()));
+    harness.projector.note_turn_failed(
+        &harness.session_id,
+        "the model refused",
+        Some("auth".into()),
+    );
     harness
         .projector
         .note_model_changed(&harness.session_id, "anthropic/claude");
@@ -705,6 +715,50 @@ fn an_elicitation_can_be_answered_by_the_id_the_wire_carried() {
         .is_none());
 }
 
+/// A replayed user message with an image (claude-agent-acp replays one as an
+/// image chunk followed by the prose) snapshots as its prose plus the image.
+/// It used to come out as the text `` `Image` `` + prose, the image dropped —
+/// so a reopened conversation showed a code span where the picture had been.
+#[test]
+fn a_snapshot_keeps_the_images_a_user_message_carried() {
+    let harness = Harness::start();
+    for content in [
+        serde_json::json!({ "type": "image", "mimeType": "image/png", "data": "iVBORw0K" }),
+        serde_json::json!({ "type": "text", "text": "can you see this issue?" }),
+    ] {
+        harness.update(serde_json::json!({
+            "sessionUpdate": "user_message_chunk",
+            "messageId": "u1",
+            "content": content,
+        }));
+    }
+
+    let messages = atlas_agent_delta::project::snapshot_messages(&lock(&harness.thread), None);
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0].content, "can you see this issue?");
+    assert_eq!(
+        messages[0].images,
+        [atlas_agent_wire::MessageImage {
+            mime_type: "image/png".into(),
+            data: "iVBORw0K".into(),
+        }]
+    );
+}
+
+/// No images, no key: every message that never had one serializes exactly as
+/// it did before the field existed.
+#[test]
+fn a_snapshot_message_without_images_omits_the_key() {
+    let harness = Harness::start();
+    lock(&harness.thread).push_user_content_block(
+        None,
+        acp::ContentBlock::Text(acp::TextContent::new("plain".to_string())),
+    );
+    let messages = atlas_agent_delta::project::snapshot_messages(&lock(&harness.thread), None);
+    let json = serde_json::to_value(&messages[0]).unwrap();
+    assert!(json.get("images").is_none(), "got: {json}");
+}
+
 /// A snapshot is what the frontend paints before any delta arrives, so it has
 /// to describe the same conversation the deltas do — including the user's half,
 /// which the live stream deliberately omits.
@@ -734,8 +788,7 @@ fn a_snapshot_carries_the_whole_conversation_including_the_user() {
     }));
 
     let thread = lock(&harness.thread);
-    let messages =
-        atlas_agent_delta::project::snapshot_messages(&thread, Some("claude-opus-5"));
+    let messages = atlas_agent_delta::project::snapshot_messages(&thread, Some("claude-opus-5"));
     drop(thread);
 
     let shape: Vec<(&str, &str)> = messages
@@ -809,7 +862,10 @@ async fn create_terminal(harness: &Harness, terminal_id: &str, args: &[&str]) {
     let terminal = std::sync::Arc::new(
         atlas_terminal::command::CommandTerminal::spawn(
             echo_binary(),
-            &args.iter().map(std::string::ToString::to_string).collect::<Vec<_>>(),
+            &args
+                .iter()
+                .map(std::string::ToString::to_string)
+                .collect::<Vec<_>>(),
             &[],
             None,
             4096,
@@ -1000,7 +1056,10 @@ async fn a_prompt_the_agent_abandoned_before_the_drain_is_still_announced_then_r
         resolved_at.is_some(),
         "and must be resolved so no pill is left open: {kinds:?}"
     );
-    assert!(request_at < resolved_at, "announced before resolved: {kinds:?}");
+    assert!(
+        request_at < resolved_at,
+        "announced before resolved: {kinds:?}"
+    );
 }
 
 /// #32 — the authoritative echo of a config-option set is the RESPONSE, not a
@@ -1310,7 +1369,10 @@ async fn a_first_empty_plan_still_says_nothing() {
     harness.pump();
 
     assert!(
-        !harness.recorder.kinds().contains(&"plan_updated".to_string()),
+        !harness
+            .recorder
+            .kinds()
+            .contains(&"plan_updated".to_string()),
         "an empty plan nobody had announced produced a delta: {:?}",
         harness.recorder.kinds()
     );

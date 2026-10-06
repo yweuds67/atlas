@@ -70,7 +70,11 @@ export interface CommandTerminal {
  *  against the id we asked for therefore usually queued against a tab that
  *  would never exist — the terminal opened, and nothing ran in it.
  */
-export function openCommandTerminal(command: string, title: string): CommandTerminal | null {
+export function openCommandTerminal(
+  command: string,
+  title: string,
+  opts?: { execute?: boolean },
+): CommandTerminal | null {
   const before = new Set(useLayoutStore.getState().tabs.map((t) => t.id));
   useLayoutStore.getState().actions.addTab({
     id: `terminal-${Date.now()}`,
@@ -88,12 +92,12 @@ export function openCommandTerminal(command: string, title: string): CommandTerm
   // A terminal of its own, even in a tab that already has one: the existing
   // shell may be mid-command, and typing into it would interleave.
   // The mirror's owner; the panel records it again on mount if this is
-  // unknown here. (No workspace-store import: that module registers Tauri
+  // unknown here. (No project-store import: that module registers Tauri
   // listeners at load, which this pure-ish helper's tests cannot host.)
   const terminalId = useTerminalStore
     .getState()
     .actions.addTerminalForCommand(tab.id, after.currentViewWsId ?? undefined);
-  useTerminalStore.getState().actions.setPendingCommand(terminalId, command);
+  useTerminalStore.getState().actions.setPendingCommand(terminalId, command, opts);
   useTerminalStore.getState().actions.requestTerminalFocus(tab.id);
   return { tabId: tab.id, terminalId, createdTab: !before.has(tab.id) };
 }

@@ -33,8 +33,8 @@ vi.mock("@tauri-apps/api/core", () => ({ invoke: mocks.invoke }));
 vi.mock("@tauri-apps/plugin-opener", () => ({ openUrl: mocks.openUrl }));
 vi.mock("@/features/log/lib/log", () => ({ logEvent: mocks.logEvent }));
 vi.mock("sonner", () => ({ toast: mocks.toast }));
-vi.mock("@/features/project/stores/project-store", () => ({
-  useProjectStore: { use: { currentProject: () => mocks.currentProject } },
+vi.mock("@/features/app/stores/app-store", () => ({
+  useAppStore: { use: { currentProject: () => mocks.currentProject } },
 }));
 
 const { GithubPanel } = await import("./github-panel");
@@ -90,6 +90,11 @@ function cloned(overrides: Partial<ClonedRepo> = {}): ClonedRepo {
 
 const calls = (cmd: string) => mocks.invoke.mock.calls.filter((c) => c[0] === cmd);
 
+/** `n` the way the panel's `toLocaleString` writes it on this machine, as a
+ *  pattern: "1,234" in one locale is "1.234" in another. */
+const grouped = (n: number) =>
+  new RegExp(n.toLocaleString().replace(/[.*+?^${}()|[\]\\]/g, "\\$&"));
+
 /** Type into the search box and submit, as a user would. */
 async function search(term: string) {
   const user = userEvent.setup();
@@ -141,8 +146,8 @@ describe("searching", () => {
     render(<GithubPanel />);
     await search("atlas");
     expect(await screen.findByText("ahammadnafiz/atlas")).toBeInTheDocument();
-    // Thousands separator comes from `toLocaleString`.
-    expect(screen.getByText(/1,234/)).toBeInTheDocument();
+    // Thousands separator comes from `toLocaleString`, so it is the machine's.
+    expect(screen.getByText(grouped(1234))).toBeInTheDocument();
     expect(screen.getByText(/56/)).toBeInTheDocument();
   });
 
@@ -213,7 +218,7 @@ describe("cloning", () => {
     render(<GithubPanel />);
     await search("atlas");
     await screen.findByText("ahammadnafiz/atlas");
-    expect(screen.queryByTitle(CLONE)).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: CLONE })).not.toBeInTheDocument();
   });
 
   it("clones into the open project, flattening the slash in the directory name", async () => {
@@ -222,7 +227,7 @@ describe("cloning", () => {
     render(<GithubPanel />);
     const user = await search("atlas");
 
-    await user.click(await screen.findByTitle(CLONE));
+    await user.click(await screen.findByRole("button", { name: CLONE }));
 
     await waitFor(() =>
       expect(mocks.invoke).toHaveBeenCalledWith("clone_github_repo", {
@@ -250,9 +255,9 @@ describe("cloning", () => {
     render(<GithubPanel />);
     const user = await search("atlas");
 
-    await user.click(await screen.findByTitle(CLONE));
+    await user.click(await screen.findByRole("button", { name: CLONE }));
 
-    const done = await screen.findByTitle("Cloned");
+    const done = await screen.findByRole("button", { name: "Cloned" });
     expect(done).toBeDisabled();
     const afterFirstClone = calls("clone_github_repo").length;
     await user.click(done);
@@ -269,7 +274,7 @@ describe("cloning", () => {
     });
     render(<GithubPanel />);
     await search("atlas");
-    expect(await screen.findByTitle("Cloned")).toBeDisabled();
+    expect(await screen.findByRole("button", { name: "Cloned" })).toBeDisabled();
   });
 
   it("notifies the rest of the app so the file tree refreshes", async () => {
@@ -280,7 +285,7 @@ describe("cloning", () => {
     try {
       render(<GithubPanel />);
       const user = await search("atlas");
-      await user.click(await screen.findByTitle(CLONE));
+      await user.click(await screen.findByRole("button", { name: CLONE }));
       await waitFor(() => expect(clonedEvent).toHaveBeenCalledTimes(1));
       expect(mocks.logEvent).toHaveBeenCalledWith(
         expect.objectContaining({ source: "github", kind: "clone" }),
@@ -302,10 +307,10 @@ describe("cloning", () => {
     render(<GithubPanel />);
     const user = await search("atlas");
 
-    await user.click(await screen.findByTitle(CLONE));
+    await user.click(await screen.findByRole("button", { name: CLONE }));
 
-    await waitFor(() => expect(screen.getByTitle(CLONE)).toBeEnabled());
-    expect(screen.queryByTitle("Cloned")).not.toBeInTheDocument();
+    await waitFor(() => expect(screen.getByRole("button", { name: CLONE })).toBeEnabled());
+    expect(screen.queryByRole("button", { name: "Cloned" })).not.toBeInTheDocument();
     expect(mocks.logEvent).not.toHaveBeenCalled();
   });
 });
@@ -329,7 +334,7 @@ describe("the cloned repos", () => {
     expect(screen.getByText("main")).toBeInTheDocument();
     expect(screen.getByText("detached")).toBeInTheDocument();
     expect(screen.getByText("A high-performance code editor")).toBeInTheDocument();
-    expect(screen.getByText(/60,000/)).toBeInTheDocument();
+    expect(screen.getByText(grouped(60_000))).toBeInTheDocument();
     expect(screen.queryByText("Search for repositories")).not.toBeInTheDocument();
 
     await search("anything");
@@ -394,7 +399,7 @@ describe("the cloned repos", () => {
     answer({ list_cloned_repos: [cloned()], update_cloned_repo: "main" });
     render(<GithubPanel />);
     await screen.findByText("zed-industries/zed");
-    await userEvent.setup().click(screen.getByTitle("Fetch origin/main"));
+    await userEvent.setup().click(screen.getByRole("button", { name: "Fetch origin/main" }));
     await waitFor(() =>
       expect(mocks.invoke).toHaveBeenCalledWith("update_cloned_repo", {
         projectPath: "/Users/dev/myproject",
@@ -408,7 +413,7 @@ describe("the cloned repos", () => {
     answer({ list_cloned_repos: [cloned({ branch: null })] });
     render(<GithubPanel />);
     await screen.findByText("zed-industries/zed");
-    expect(screen.getByTitle("Pick a branch to fetch")).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Pick a branch to fetch" })).toBeDisabled();
   });
 
   it("deletes only on the second click", async () => {
@@ -416,9 +421,9 @@ describe("the cloned repos", () => {
     render(<GithubPanel />);
     await screen.findByText("zed-industries/zed");
     const user = userEvent.setup();
-    await user.click(screen.getByTitle("Delete clone"));
+    await user.click(screen.getByRole("button", { name: "Delete clone" }));
     expect(calls("delete_cloned_repo")).toHaveLength(0);
-    await user.click(screen.getByTitle("Click again to delete the clone"));
+    await user.click(screen.getByRole("button", { name: "Click again to delete the clone" }));
     await waitFor(() =>
       expect(mocks.invoke).toHaveBeenCalledWith("delete_cloned_repo", {
         projectPath: "/Users/dev/myproject",

@@ -10,7 +10,7 @@
 //!
 //! # What made the cut
 //!
-//! The request was "codex's defaults, minus login". Each command lands by what
+//! The request was "the engine's defaults, minus login". Each command lands by what
 //! actually executes it:
 //!
 //! - **Protocol calls** — `/compact` (`thread/compact/start`), `/undo`
@@ -121,11 +121,11 @@ pub fn available(skills: &[SkillRef]) -> Vec<acp::AvailableCommand> {
             "review",
             "Review the uncommitted changes in this repository",
         ),
+        acp::AvailableCommand::new("status", "Show this session's model and working directory"),
         acp::AvailableCommand::new(
-            "status",
-            "Show this session's model and working directory",
+            "undo",
+            "Rewind the conversation to before your last message",
         ),
-        acp::AvailableCommand::new("undo", "Rewind the conversation to before your last message"),
     ];
     for skill in skills {
         if commands.iter().any(|c| c.name == skill.name) {

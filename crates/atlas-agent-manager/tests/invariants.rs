@@ -46,7 +46,7 @@ async fn concurrent_requests_for_one_agent_start_exactly_one_connection() {
 
     for round in 0..ROUNDS {
         let catalog = TestCatalog::new(&[]);
-        let server = TestServer::new("cersei");
+        let server = TestServer::new("atlas-agent");
         let manager = manager(catalog, server.clone());
         // The native agent, because `connect_to` resolves the server itself and
         // a custom one resolves to a `CustomAgentServer` that spawns a real
@@ -202,7 +202,7 @@ async fn open_session(
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_version_bump_forgets_the_sessions_it_orphans() {
+async fn a_version_bump_orphans_nothing_and_the_restart_releases_the_old_process() {
     let catalog = TestCatalog::new(&["claude-code"]);
     let server = TestServer::new("claude-code");
     let manager = manager(catalog.clone(), server.clone());
@@ -213,12 +213,14 @@ async fn a_version_bump_forgets_the_sessions_it_orphans() {
     assert_eq!(server.live_connections(), 1);
 
     catalog.announce_new_version("claude-code", "2.0.0");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    // The bump alone forgets nothing: a session the manager dropped while the
+    // host still held it failed its next send with "unknown session id".
+    assert_eq!(manager.sessions().len(), 1);
 
-    wait_for(|| manager.sessions().is_empty().then_some(()))
-        .await
-        .expect("a version bump forgets the sessions on the old connection");
-    // The point of forgetting them: the session was the last thing pinning the
-    // connection, and the old binary's process goes with it.
+    // The host's restart is what releases it — and with it the old binary.
+    manager.drop_connection(&key);
+    assert!(manager.sessions().is_empty());
     wait_for(|| (server.live_connections() == 0).then_some(()))
         .await
         .expect("the old connection is released");
@@ -252,9 +254,11 @@ async fn a_restart_forgets_the_sessions_on_the_connection_it_replaces() {
     let key = custom("claude-code");
 
     open_session(&manager, key.clone(), server.clone()).await;
-    wait_for(|| (manager.connection_status(&key) == AgentConnectionStatus::Connected).then_some(()))
-        .await
-        .expect("connected");
+    wait_for(|| {
+        (manager.connection_status(&key) == AgentConnectionStatus::Connected).then_some(())
+    })
+    .await
+    .expect("connected");
     assert_eq!(manager.sessions().len(), 1);
 
     settle(manager.restart_connection(key.clone(), server.clone()))
@@ -413,9 +417,11 @@ async fn a_gated_connect_that_is_left_alone_still_connects() {
     gate.open();
 
     settle(entry).await.expect("the connection comes up");
-    wait_for(|| (manager.connection_status(&key) == AgentConnectionStatus::Connected).then_some(()))
-        .await
-        .expect("the entry reaches Connected");
+    wait_for(|| {
+        (manager.connection_status(&key) == AgentConnectionStatus::Connected).then_some(())
+    })
+    .await
+    .expect("the entry reaches Connected");
     assert_eq!(server.connects_cancelled(), 0);
     assert_eq!(server.live_connections(), 1);
 }
@@ -427,7 +433,7 @@ async fn a_gated_connect_that_is_left_alone_still_connects() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_superseded_turns_late_reply_does_not_close_the_turn_that_superseded_it() {
     let catalog = TestCatalog::new(&[]);
-    let server = TestServer::new("cersei");
+    let server = TestServer::new("atlas-agent");
     let manager = manager(catalog, server.clone());
 
     let thread = manager
@@ -487,7 +493,7 @@ async fn a_superseded_turns_late_reply_does_not_close_the_turn_that_superseded_i
 #[tokio::test(flavor = "multi_thread")]
 async fn a_superseded_turns_failure_does_not_mark_the_live_turn_as_errored() {
     let catalog = TestCatalog::new(&[]);
-    let server = TestServer::new("cersei");
+    let server = TestServer::new("atlas-agent");
     let manager = manager(catalog, server.clone());
 
     let thread = manager
@@ -545,7 +551,7 @@ async fn a_superseded_turns_failure_does_not_mark_the_live_turn_as_errored() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_cancelled_turn_still_closes_itself() {
     let catalog = TestCatalog::new(&[]);
-    let server = TestServer::new("cersei");
+    let server = TestServer::new("atlas-agent");
     let manager = manager(catalog, server.clone());
 
     let thread = manager
@@ -637,7 +643,7 @@ async fn closing_an_ambiguous_session_id_is_an_error_not_a_silent_success() {
 #[tokio::test(flavor = "multi_thread")]
 async fn an_unsuperseded_turn_closes_itself() {
     let catalog = TestCatalog::new(&[]);
-    let server = TestServer::new("cersei");
+    let server = TestServer::new("atlas-agent");
     let manager = manager(catalog, server.clone());
 
     let thread = manager
@@ -651,7 +657,10 @@ async fn an_unsuperseded_turn_closes_itself() {
         .await
         .expect("the turn runs");
 
-    assert!(!thread.lock().unwrap().is_generating(), "the turn was closed");
+    assert!(
+        !thread.lock().unwrap().is_generating(),
+        "the turn was closed"
+    );
 }
 
 // --------------------------------------------------------- ATL-230: minor
@@ -672,7 +681,9 @@ async fn an_agent_uninstalled_mid_connect_reports_that_it_is_not_installed() {
     catalog.hide_resolver("claude-code");
     let entry = manager.request_connection(custom("claude-code"), server.clone());
 
-    let error = settle(entry).await.expect_err("there is nothing to connect to");
+    let error = settle(entry)
+        .await
+        .expect_err("there is nothing to connect to");
     assert!(
         matches!(&error, LoadError::Unsupported { message } if message.contains("not installed")),
         "the error should say the agent is not installed, not name an internal resolver: {error}"
@@ -753,7 +764,13 @@ async fn a_connection_announces_itself_and_its_failures() {
     .await
     .expect("the failure is announced");
     assert_eq!(failure.0, key);
-    assert!(matches!(failure.1, LoadError::Exited { status: Some(1), .. }));
+    assert!(matches!(
+        failure.1,
+        LoadError::Exited {
+            status: Some(1),
+            ..
+        }
+    ));
 
     server.set_behaviour(ConnectBehaviour::Immediate);
     settle(manager.request_connection(key.clone(), server.clone()))
@@ -799,7 +816,13 @@ async fn a_failed_entry_records_the_error_for_whoever_was_waiting() {
     let error = settle(entry)
         .await
         .expect_err("the entry the caller holds still carries the failure");
-    assert!(matches!(error, LoadError::Exited { status: Some(2), .. }));
+    assert!(matches!(
+        error,
+        LoadError::Exited {
+            status: Some(2),
+            ..
+        }
+    ));
 }
 
 /// A connect that fails with an `anyhow` chain keeps its cause.
@@ -845,6 +868,13 @@ async fn closing_a_session_forgets_it_without_touching_the_connection() {
     let key = custom("claude-code");
 
     let session_id = open_session(&manager, key.clone(), server.clone()).await;
+    // The entry flips to Connected on a spawned task, after the connect future
+    // `open_session` awaited; wait for it so the assertion below is about close.
+    wait_for(|| {
+        (manager.connection_status(&key) == AgentConnectionStatus::Connected).then_some(())
+    })
+    .await
+    .expect("connected");
     assert_eq!(manager.sessions().len(), 1);
 
     manager
@@ -865,7 +895,7 @@ async fn closing_a_session_forgets_it_without_touching_the_connection() {
 #[tokio::test(flavor = "multi_thread")]
 async fn cancelling_an_unknown_session_is_a_no_op() {
     let catalog = TestCatalog::new(&[]);
-    let server = TestServer::new("cersei");
+    let server = TestServer::new("atlas-agent");
     let manager = manager(catalog, server);
 
     // No panic, no error: the id simply names nothing.
@@ -963,7 +993,10 @@ async fn a_restart_replaces_a_stale_connect_but_joins_a_young_one() {
     let outcome = tokio::time::timeout(Duration::from_secs(5), settle(first.clone()))
         .await
         .expect("the stale attempt's waiter is released");
-    assert!(outcome.is_err(), "a cancelled connect does not report success");
+    assert!(
+        outcome.is_err(),
+        "a cancelled connect does not report success"
+    );
     wait_for(|| (server.connects_cancelled() == 1).then_some(()))
         .await
         .expect("the stale attempt was cancelled, not abandoned");
@@ -971,9 +1004,11 @@ async fn a_restart_replaces_a_stale_connect_but_joins_a_young_one() {
     // And the fresh one still completes once the server answers.
     gate.open();
     settle(replaced).await.expect("the replacement connects");
-    wait_for(|| (manager.connection_status(&key) == AgentConnectionStatus::Connected).then_some(()))
-        .await
-        .expect("connected");
+    wait_for(|| {
+        (manager.connection_status(&key) == AgentConnectionStatus::Connected).then_some(())
+    })
+    .await
+    .expect("connected");
     assert_eq!(
         server.attempts(),
         server.live_connections() + server.connects_cancelled(),

@@ -1,7 +1,7 @@
 //! The `AgentConnection` seam — ported from `zed-ref/crates/acp_thread/src/connection.rs`.
 //!
 //! This is the trait every agent implements: external ACP agents (through
-//! `atlas-agent-servers`) and the native agent (Cersei) alike. It is ported
+//! `atlas-agent-servers`) and the native agent alike. It is ported
 //! near-verbatim, because it is the contract the whole UI consumes; the
 //! deviations are only the ones forced by not being GPUI, and each is called out
 //! at the point it appears. The catalogue of them lives in [`crate`]'s module
@@ -24,7 +24,7 @@ use uuid::Uuid;
 
 use crate::{AcpThreadHandle, ElicitationStoreHandle};
 
-/// Identifies an agent (`"claude-code"`, `"cersei"`, …).
+/// Identifies an agent (`"claude-code"`, `"atlas-agent"`, …).
 ///
 /// Zed's lives in its `project` crate; the port keeps a local newtype so this
 /// crate stays leaf-level.
@@ -220,6 +220,17 @@ pub trait AgentConnection: Send + Sync {
         false
     }
 
+    /// Whether this agent advertised `mcpCapabilities.http` at `initialize`,
+    /// i.e. whether it accepts an HTTP MCP server in `session/new`'s
+    /// `mcpServers`.
+    ///
+    /// Session-independent, like [`Self::supports_rewind`]: it is fixed by the
+    /// handshake, so it is known before any session exists. Decided only by
+    /// what the agent advertised, never by which agent it is.
+    fn supports_http_mcp(&self) -> bool {
+        false
+    }
+
     /// Whether this agent can drop its own last turn — see [`AgentSessionRewind`].
     ///
     /// Session-independent, like [`Self::supports_logout`], because the
@@ -245,7 +256,10 @@ pub trait AgentConnection: Send + Sync {
     }
 
     /// Close an existing session. Allows the agent to free the session from memory.
-    fn close_session(self: Arc<Self>, _session_id: acp::SessionId) -> BoxFuture<'static, Result<()>> {
+    fn close_session(
+        self: Arc<Self>,
+        _session_id: acp::SessionId,
+    ) -> BoxFuture<'static, Result<()>> {
         Box::pin(async { Err(anyhow::Error::msg("Closing sessions is not supported")) })
     }
 
@@ -298,10 +312,8 @@ pub trait AgentConnection: Send + Sync {
         None
     }
 
-    fn prompt(
-        &self,
-        params: acp::PromptRequest,
-    ) -> BoxFuture<'static, Result<acp::PromptResponse>>;
+    fn prompt(&self, params: acp::PromptRequest)
+        -> BoxFuture<'static, Result<acp::PromptResponse>>;
 
     fn retry(&self, _session_id: &acp::SessionId) -> Option<Arc<dyn AgentSessionRetry>> {
         None

@@ -1,8 +1,10 @@
 import { useEffect, useRef, useState } from "react";
-import * as DropdownMenu from "@radix-ui/react-dropdown-menu";
+import { Menu as DropdownMenu } from "@base-ui/react/menu";
 import {
   Check,
   ChevronDown,
+  ClipboardCopy,
+  ClipboardPaste,
   Copy,
   FileJson,
   Lock,
@@ -11,19 +13,25 @@ import {
   RotateCcw,
   Trash2,
 } from "lucide-react";
+import { toast } from "sonner";
+import { copyText } from "@/lib/clipboard";
 import { cn } from "@/lib/utils";
-import { Tooltip, TooltipContent, TooltipTrigger } from "@/ui/tooltip";
+import { Hint } from "@/ui/tooltip";
 import { openKeybindingsFile } from "../lib/keybindings-api";
+import { PRESET_BY_ID, PRESETS } from "../lib/presets";
+import { exportProfile } from "../lib/profile-transfer";
 import { useKeybindingsStore } from "../stores/keybindings-store";
+import { ImportProfileDialog } from "./import-profile-dialog";
+import { PresetIcon } from "./preset-icon";
 
 // Same recipe as the account menu so every Atlas dropdown reads alike.
 const CONTENT_CLASS =
-  "z-[var(--z-max)] min-w-[200px] max-w-[280px] rounded-md border border-[var(--border-default)] " +
-  "bg-[var(--bg-secondary)] shadow-[var(--shadow-overlay)] py-1";
+  "min-w-[200px] max-w-[280px] rounded-md border border-[var(--border)] " +
+  "bg-[var(--card)] shadow-md py-1";
 const ITEM_CLASS =
-  "flex items-center gap-2 px-3 h-[26px] text-[11px] cursor-pointer outline-none " +
-  "text-[var(--text-secondary)] data-[highlighted]:bg-[var(--bg-hover)] " +
-  "data-[highlighted]:text-[var(--text-primary)]";
+  "flex items-center gap-2 px-3 h-[26px] text-xs cursor-pointer outline-none " +
+  "text-[var(--secondary-foreground)] data-[highlighted]:bg-[var(--atlas-element-hover)] " +
+  "data-[highlighted]:text-[var(--foreground)]";
 
 /** The three ways the inline name field is used. */
 type NamingMode = "create" | "duplicate" | "rename";
@@ -53,7 +61,10 @@ export function ProfileBar() {
     renameProfile,
     deleteProfile,
     resetProfile,
+    createProfileFromPreset,
+    setProfilePreset,
   } = useKeybindingsStore.use.actions();
+  const [importing, setImporting] = useState(false);
   const active = file.profiles.find((p) => p.id === file.activeProfileId) ?? file.profiles[0]!;
   const locked = !!active.builtIn;
   const overrideCount = Object.keys(active.bindings).length;
@@ -94,10 +105,10 @@ export function ProfileBar() {
   };
 
   return (
-    <div className="flex h-[29px] shrink-0 items-center gap-1 border-b border-border-default px-2">
+    <div className="flex h-[29px] shrink-0 items-center gap-1 border-b border-border px-2">
       {naming ? (
         <div className="flex items-center gap-1.5 px-2">
-          <span className="text-[11px] font-normal text-text-tertiary">Profile</span>
+          <span className="text-xs font-normal text-muted-foreground">Profile</span>
           <input
             ref={inputRef}
             value={draft}
@@ -112,87 +123,111 @@ export function ProfileBar() {
               e.stopPropagation();
             }}
             className={cn(
-              "h-6 w-[200px] rounded-md border border-border-strong bg-bg-elevated px-2 text-[11px]",
-              "text-text-primary outline-none placeholder:text-text-muted",
+              "h-6 w-[200px] rounded-md border border-border-strong bg-card px-2 text-xs",
+              "text-foreground outline-none placeholder:text-muted-foreground",
             )}
           />
         </div>
       ) : (
         <DropdownMenu.Root>
-          <DropdownMenu.Trigger asChild>
-            <button
-              type="button"
-              className={cn(
-                "flex h-6 items-center gap-1.5 rounded-md px-2 text-[11px] font-medium",
-                "text-text-primary hover:bg-bg-hover transition-colors cursor-pointer",
-              )}
-            >
-              <span className="text-text-tertiary font-normal">Profile</span>
-              <span className="max-w-[180px] truncate">{active.name}</span>
-              {locked && <Lock size={10} className="text-text-tertiary" />}
-              <ChevronDown size={11} className="text-text-tertiary" />
-            </button>
-          </DropdownMenu.Trigger>
+          <DropdownMenu.Trigger
+            render={
+              <button
+                type="button"
+                className={cn(
+                  "flex h-6 items-center gap-1.5 rounded-md px-2 text-xs font-medium",
+                  "text-foreground hover:bg-element-hover transition-colors cursor-pointer",
+                )}
+              >
+                <span className="text-muted-foreground font-normal">Profile</span>
+                <span className="max-w-[180px] truncate">{active.name}</span>
+                {locked && <Lock size={10} className="text-muted-foreground" />}
+                <ChevronDown size={11} className="text-muted-foreground" />
+              </button>
+            }
+          />
           <DropdownMenu.Portal>
-            <DropdownMenu.Content
-              align="start"
-              sideOffset={4}
-              className={CONTENT_CLASS}
-              onCloseAutoFocus={(e) => {
-                if (openingInput.current) e.preventDefault();
-              }}
-            >
-              {file.profiles.map((p) => (
+            <DropdownMenu.Positioner className="z-popover" align="start" sideOffset={4}>
+              <DropdownMenu.Popup
+                className={CONTENT_CLASS}
+                // Base UI replaces Radix's onCloseAutoFocus with finalFocus:
+                // `false` means "leave focus alone", `true` means "do the
+                // default thing" (return it to the trigger).
+                finalFocus={() => !openingInput.current}
+              >
+                {file.profiles.map((p) => (
+                  <DropdownMenu.Item
+                    key={p.id}
+                    onClick={() => setActiveProfile(p.id)}
+                    className={ITEM_CLASS}
+                  >
+                    <span className="flex w-3 justify-center">
+                      {p.id === active.id && <Check size={11} />}
+                    </span>
+                    <span className="flex-1 truncate">{p.name}</span>
+                    {p.builtIn ? (
+                      <Lock size={10} className="text-muted-foreground" />
+                    ) : (
+                      <span className="text-2xs tabular-nums text-muted-foreground">
+                        {Object.keys(p.bindings).length || ""}
+                      </span>
+                    )}
+                  </DropdownMenu.Item>
+                ))}
+                <DropdownMenu.Separator className="my-1 h-px bg-[var(--border)]" />
                 <DropdownMenu.Item
-                  key={p.id}
-                  onSelect={() => setActiveProfile(p.id)}
+                  onClick={() => {
+                    openingInput.current = true;
+                    startNaming("create");
+                  }}
                   className={ITEM_CLASS}
                 >
                   <span className="flex w-3 justify-center">
-                    {p.id === active.id && <Check size={11} />}
+                    <Plus size={11} />
                   </span>
-                  <span className="flex-1 truncate">{p.name}</span>
-                  {p.builtIn ? (
-                    <Lock size={10} className="text-text-tertiary" />
-                  ) : (
-                    <span className="text-[9.5px] tabular-nums text-text-muted">
-                      {Object.keys(p.bindings).length || ""}
-                    </span>
-                  )}
+                  <span className="flex-1">New profile…</span>
                 </DropdownMenu.Item>
-              ))}
-              <DropdownMenu.Separator className="my-1 h-px bg-[var(--border-default)]" />
-              <DropdownMenu.Item
-                onSelect={() => {
-                  openingInput.current = true;
-                  startNaming("create");
-                }}
-                className={ITEM_CLASS}
-              >
-                <span className="flex w-3 justify-center">
-                  <Plus size={11} />
-                </span>
-                <span className="flex-1">New profile…</span>
-              </DropdownMenu.Item>
-              <DropdownMenu.Item
-                onSelect={() => {
-                  openingInput.current = true;
-                  startNaming("duplicate");
-                }}
-                className={ITEM_CLASS}
-              >
-                <span className="flex w-3 justify-center">
-                  <Copy size={10} />
-                </span>
-                <span className="flex-1 truncate">Duplicate “{active.name}”…</span>
-              </DropdownMenu.Item>
-            </DropdownMenu.Content>
+                <DropdownMenu.Item
+                  onClick={() => {
+                    openingInput.current = true;
+                    startNaming("duplicate");
+                  }}
+                  className={ITEM_CLASS}
+                >
+                  <span className="flex w-3 justify-center">
+                    <Copy size={10} />
+                  </span>
+                  <span className="flex-1 truncate">Duplicate “{active.name}”…</span>
+                </DropdownMenu.Item>
+                <DropdownMenu.Separator className="my-1 h-px bg-[var(--border)]" />
+                <div className="px-3 pb-0.5 pt-1 text-2xs text-muted-foreground">
+                  New from an editor's keys
+                </div>
+                {PRESETS.map((preset) => (
+                  <DropdownMenu.Item
+                    key={preset.id}
+                    onClick={() => createProfileFromPreset(preset.id)}
+                    className={ITEM_CLASS}
+                  >
+                    <PresetIcon id={preset.id} className="size-3 shrink-0" />
+                    <span className="flex-1 truncate">{preset.label}</span>
+                  </DropdownMenu.Item>
+                ))}
+              </DropdownMenu.Popup>
+            </DropdownMenu.Positioner>
           </DropdownMenu.Portal>
         </DropdownMenu.Root>
       )}
 
+      {!locked && (
+        <PresetPicker
+          value={active.basedOn ?? null}
+          onChange={(presetId) => setProfilePreset(active.id, presetId)}
+        />
+      )}
+
       {!locked && overrideCount > 0 && (
-        <span className="text-[10px] tabular-nums text-text-tertiary">
+        <span className="text-2xs tabular-nums text-muted-foreground">
           {overrideCount} {overrideCount === 1 ? "override" : "overrides"}
         </span>
       )}
@@ -229,12 +264,77 @@ export function ProfileBar() {
         >
           <Trash2 size={12} />
         </IconButton>
-        <span className="mx-1 h-3.5 w-px bg-border-default" />
+        <span className="mx-1 h-3.5 w-px bg-border" />
+        <IconButton
+          label={`Copy “${active.name}” as JSON`}
+          onClick={() =>
+            void copyText(exportProfile(active)).then((ok) =>
+              ok ? toast.success("Profile copied") : toast.error("Could not copy the profile"),
+            )
+          }
+        >
+          <ClipboardCopy size={12} />
+        </IconButton>
+        <IconButton label="Import a profile…" onClick={() => setImporting(true)}>
+          <ClipboardPaste size={12} />
+        </IconButton>
         <IconButton label="Open keybindings.json" onClick={() => void openKeybindingsFile()}>
           <FileJson size={12} />
         </IconButton>
       </div>
+      <ImportProfileDialog open={importing} onOpenChange={setImporting} />
     </div>
+  );
+}
+
+/** "Keys from: VS Code ▾" — the preset layered under the active profile. */
+function PresetPicker({
+  value,
+  onChange,
+}: {
+  value: string | null;
+  onChange: (presetId: (typeof PRESETS)[number]["id"] | null) => void;
+}) {
+  const current = value ? (PRESET_BY_ID.get(value)?.label ?? value) : "Atlas";
+  return (
+    <DropdownMenu.Root>
+      <Hint label="Which editor's keys this profile starts from">
+        <DropdownMenu.Trigger
+          render={
+            <button
+              type="button"
+              className={cn(
+                "flex h-6 items-center gap-1.5 rounded-md px-2 text-xs",
+                "text-secondary-foreground hover:bg-element-hover hover:text-foreground",
+                "transition-colors cursor-pointer",
+              )}
+            >
+              <span className="text-muted-foreground">Keys from</span>
+              <span className="max-w-[120px] truncate">{current}</span>
+              <ChevronDown size={11} className="text-muted-foreground" />
+            </button>
+          }
+        />
+      </Hint>
+      <DropdownMenu.Portal>
+        <DropdownMenu.Positioner className="z-popover" align="start" sideOffset={4}>
+          <DropdownMenu.Popup className={CONTENT_CLASS}>
+            {[{ id: null, label: "Atlas" } as const, ...PRESETS].map((p) => (
+              <DropdownMenu.Item
+                key={p.id ?? "atlas"}
+                onClick={() => onChange(p.id)}
+                className={ITEM_CLASS}
+              >
+                <span className="flex w-3 justify-center">
+                  {p.id === value && <Check size={11} />}
+                </span>
+                <span className="flex-1 truncate">{p.label}</span>
+              </DropdownMenu.Item>
+            ))}
+          </DropdownMenu.Popup>
+        </DropdownMenu.Positioner>
+      </DropdownMenu.Portal>
+    </DropdownMenu.Root>
   );
 }
 
@@ -252,26 +352,22 @@ export function IconButton({
   children: React.ReactNode;
 }) {
   return (
-    <Tooltip>
-      <TooltipTrigger asChild>
-        <button
-          type="button"
-          aria-label={label}
-          aria-pressed={active}
-          disabled={disabled}
-          onClick={onClick}
-          className={cn(
-            "flex h-6 w-6 items-center justify-center rounded-md transition-colors",
-            active
-              ? "bg-bg-selected text-text-primary"
-              : "text-text-secondary hover:bg-bg-hover hover:text-text-primary",
-            disabled ? "opacity-35 cursor-not-allowed" : "cursor-pointer",
-          )}
-        >
-          {children}
-        </button>
-      </TooltipTrigger>
-      <TooltipContent>{label}</TooltipContent>
-    </Tooltip>
+    <Hint label={label}>
+      <button
+        type="button"
+        aria-pressed={active}
+        disabled={disabled}
+        onClick={onClick}
+        className={cn(
+          "flex h-6 w-6 items-center justify-center rounded-md transition-colors",
+          active
+            ? "bg-element-selected text-foreground"
+            : "text-secondary-foreground hover:bg-element-hover hover:text-foreground",
+          disabled ? "opacity-35 cursor-not-allowed" : "cursor-pointer",
+        )}
+      >
+        {children}
+      </button>
+    </Hint>
   );
 }

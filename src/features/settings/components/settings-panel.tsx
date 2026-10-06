@@ -3,9 +3,12 @@ import { invoke } from "@tauri-apps/api/core";
 import { toast } from "sonner";
 import { ScrollArea } from "@/ui/scroll-area";
 import { cn } from "@/lib/utils";
+import { isLinux, isMac, isWindows } from "@/lib/platform";
+import { Hint } from "@/ui/tooltip";
 import {
   Settings,
   Palette,
+  Shapes,
   Keyboard,
   Info,
   KeyRound,
@@ -20,24 +23,32 @@ import {
   DownloadCloud,
 } from "lucide-react";
 import { clampScale, SCALE_STEP, MIN_SCALE, MAX_SCALE, DEFAULT_SCALE } from "../lib/ui-scale";
+import { APP_ICONS } from "../lib/app-icons";
 import { AtlasIcon } from "@/components/atlas-icon";
 import { ProvidersSettings } from "./providers-settings";
 import { LayoutsSettings } from "./layouts-settings";
-import { CodeEditorThemesSettings } from "./code-editor-themes-settings";
 import { AtlasThemesSettings } from "./atlas-themes-settings";
+import { IconThemesSettings } from "./icon-themes-settings";
 import { SkillsAndPacks } from "./skills-and-packs";
 import { AgentsMarketplace } from "./agents-marketplace/agents-marketplace";
 import { ModelsManager } from "./models-manager";
 import { KeybindingsSettings } from "./keybindings-settings";
 import { useActionShortcut } from "@/features/keybindings/lib/use-action-shortcut";
 import { useModelPricingStore } from "../stores/model-pricing-store";
-import { useProjectStore } from "@/features/project/stores/project-store";
 import { setEnabled as setTelemetryEnabled } from "@/features/telemetry/posthog-client";
 import { useFeedbackStore } from "@/features/feedback/stores/feedback-store";
 import { updater } from "@/features/updater/lib/updater-api";
 import { useUpdaterStore } from "@/features/updater/stores/updater-store";
+import { useAppProfile } from "@/lib/app-profile";
 import { useSettingsNav, type SettingsSection } from "../stores/settings-nav-store";
 import { openConfigFile } from "../lib/atlas-config-api";
+import type { AppSettings } from "../lib/app-settings";
+import { useSettingsStore } from "@/features/settings/stores/settings-store";
+import { NotificationsSettings } from "./notifications-settings";
+import { SectionTitle, SettingRow, Toggle } from "./settings-controls";
+
+export { Toggle };
+import { useAgentRegistryStore } from "@/features/agents/stores/agent-registry-store";
 
 const SECTIONS: Array<{
   id: SettingsSection;
@@ -46,6 +57,7 @@ const SECTIONS: Array<{
 }> = [
   { id: "general", label: "General", icon: Settings },
   { id: "appearance", label: "Appearance", icon: Palette },
+  { id: "icons", label: "Icons", icon: Shapes },
   { id: "layouts", label: "Layouts", icon: LayoutTemplate },
   { id: "providers", label: "API Keys", icon: KeyRound },
   { id: "skills", label: "Skills", icon: Zap },
@@ -65,12 +77,23 @@ export function SettingsPanel({ initialSection }: { initialSection?: string } = 
   // sidebar's Skills button), whether this panel is fresh or already mounted.
   const navSection = useSettingsNav((s) => s.section);
   const clearNav = useSettingsNav((s) => s.clear);
+  const setShown = useSettingsNav((s) => s.setShown);
+  useEffect(() => {
+    setShown(activeSection);
+    return () => setShown(null);
+  }, [activeSection, setShown]);
   useEffect(() => {
     if (navSection) {
       setActiveSection(navSection);
       clearNav();
     }
   }, [navSection, clearNav]);
+  // Installed agents whose copy on disk is behind the registry. Background
+  // prefetch clears most of these on its own; what is left (offline, npm
+  // failing) is what needs the user's hand, so the nav says so.
+  const agentUpdates = useAgentRegistryStore(
+    (s) => s.registryEntries.filter((e) => e.installed && e.updateAvailable).length,
+  );
   const [navCollapsed, setNavCollapsed] = useState(() => {
     try {
       return localStorage.getItem(NAV_COLLAPSED_KEY) === "1";
@@ -94,48 +117,70 @@ export function SettingsPanel({ initialSection }: { initialSection?: string } = 
       {/* Settings nav — collapses to an icon rail (labels become tooltips). */}
       <div
         className={cn(
-          "shrink-0 border-r border-border-default bg-bg-primary pt-2 flex flex-col",
+          "shrink-0 border-r border-border bg-background pt-2 flex flex-col",
           navCollapsed ? "w-[44px]" : "w-[180px]",
         )}
       >
         <div className="flex-1">
-          {SECTIONS.map((s) => (
-            <button
-              key={s.id}
-              onClick={() => setActiveSection(s.id)}
-              title={navCollapsed ? s.label : undefined}
-              className={cn(
-                "w-full flex items-center h-[32px] whitespace-nowrap text-[11px] font-medium transition-colors border-l-2 cursor-pointer",
-                navCollapsed ? "justify-center px-0" : "gap-2 px-4",
-                activeSection === s.id
-                  ? "text-text-primary bg-bg-selected border-l-accent"
-                  : "text-text-secondary hover:bg-bg-hover border-l-transparent",
-              )}
-            >
-              <s.icon size={13} className="shrink-0" />
-              {!navCollapsed && s.label}
-            </button>
-          ))}
+          {SECTIONS.map((s) => {
+            const badge = s.id === "agents" ? agentUpdates : 0;
+            const item = (
+              <button
+                key={s.id}
+                onClick={() => setActiveSection(s.id)}
+                className={cn(
+                  "w-full flex items-center h-[32px] whitespace-nowrap text-xs font-medium transition-colors border-l-2 cursor-pointer",
+                  navCollapsed ? "justify-center px-0" : "gap-2 px-4",
+                  activeSection === s.id
+                    ? "text-foreground bg-element-selected border-l-primary"
+                    : "text-secondary-foreground hover:bg-element-hover border-l-transparent",
+                )}
+              >
+                <span className="relative shrink-0 flex">
+                  <s.icon size={13} />
+                  {navCollapsed && badge > 0 && (
+                    <span className="pointer-events-none absolute -right-1 -top-1 size-1.5 rounded-full bg-[var(--primary)]" />
+                  )}
+                </span>
+                {!navCollapsed && s.label}
+                {!navCollapsed && badge > 0 && (
+                  <span className="ml-auto min-w-4 h-4 px-1 rounded-full bg-[var(--primary)] text-primary-foreground text-3xs leading-4 text-center tabular-nums">
+                    {badge}
+                  </span>
+                )}
+              </button>
+            );
+            const label =
+              badge > 0 ? `${s.label} — ${badge} update${badge === 1 ? "" : "s"} waiting` : s.label;
+            return navCollapsed ? (
+              <Hint key={s.id} label={label} side="right">
+                {item}
+              </Hint>
+            ) : (
+              item
+            );
+          })}
         </div>
 
         {/* Hide / show toggle — divided from the section list. */}
-        <button
-          onClick={toggleNav}
-          title={navCollapsed ? "Show sidebar" : "Hide sidebar"}
-          className={cn(
-            "mt-1 flex items-center h-[30px] whitespace-nowrap border-t border-border-default text-[11px] font-medium text-text-tertiary hover:bg-bg-hover hover:text-text-primary transition-colors cursor-pointer",
-            navCollapsed ? "justify-center px-0" : "gap-2 px-4",
-          )}
-        >
-          {navCollapsed ? (
-            <ChevronRight size={14} className="shrink-0" />
-          ) : (
-            <>
-              <ChevronLeft size={14} className="shrink-0" />
-              <span>Hide</span>
-            </>
-          )}
-        </button>
+        <Hint label={navCollapsed ? "Show sidebar" : "Hide sidebar"} side="right">
+          <button
+            onClick={toggleNav}
+            className={cn(
+              "mt-1 flex items-center h-[30px] whitespace-nowrap border-t border-border text-xs font-medium text-muted-foreground hover:bg-element-hover hover:text-foreground transition-colors cursor-pointer",
+              navCollapsed ? "justify-center px-0" : "gap-2 px-4",
+            )}
+          >
+            {navCollapsed ? (
+              <ChevronRight size={14} className="shrink-0" />
+            ) : (
+              <>
+                <ChevronLeft size={14} className="shrink-0" />
+                <span>Hide</span>
+              </>
+            )}
+          </button>
+        </Hint>
       </div>
 
       {/* Settings content. The providers ("API Keys") and skills sections are
@@ -161,7 +206,12 @@ export function SettingsPanel({ initialSection }: { initialSection?: string } = 
         </div>
       ) : activeSection === "appearance" ? (
         <div className="flex-1 min-w-0 min-h-0">
-          <AppearanceSettings />
+          {/* Interface zoom lives in General, so this pane is the theme picker alone. */}
+          <AtlasThemesSettings />
+        </div>
+      ) : activeSection === "icons" ? (
+        <div className="flex-1 min-w-0 min-h-0">
+          <IconThemesSettings />
         </div>
       ) : activeSection === "keybindings" ? (
         <div className="flex-1 min-w-0 min-h-0">
@@ -181,7 +231,7 @@ export function SettingsPanel({ initialSection }: { initialSection?: string } = 
   );
 }
 
-interface CliStatus {
+export interface CliStatus {
   installed: boolean;
   path: string | null;
   installedVersion: string | null;
@@ -189,12 +239,16 @@ interface CliStatus {
 }
 
 function GeneralSettings() {
-  const settings = useProjectStore.use.settings();
-  const configError = useProjectStore.use.configError();
-  const { updateSettings, clearConfigError, resetConfig } = useProjectStore.use.actions();
+  const settings = useSettingsStore.use.settings();
+  const configError = useSettingsStore.use.configError();
+  const { updateSettings, clearConfigError, resetConfig } = useSettingsStore.use.actions();
   const [cli, setCli] = useState<CliStatus | null>(null);
   const [installing, setInstalling] = useState(false);
   const [resettingConfig, setResettingConfig] = useState(false);
+  // `.atlas` in the released app, `.atlas-dev` in a dev-profile build, which
+  // also keeps it out of git through `.git/info/exclude` rather than editing
+  // the project's own `.gitignore`.
+  const { dev: devProfile, dirName: atlasDir, productName } = useAppProfile();
 
   const recreateConfigDefaults = async () => {
     setResettingConfig(true);
@@ -267,18 +321,18 @@ function GeneralSettings() {
     <div className="space-y-6">
       <SectionTitle title="General" subtitle="Application preferences" />
       {configError && (
-        <div className="rounded-md border border-amber-500/40 bg-amber-500/10 p-3 space-y-2">
-          <p className="text-[12px] font-medium text-text-primary">
+        <div className="rounded-md border border-warning/40 bg-warning-muted p-3 space-y-2">
+          <p className="text-sm font-medium text-foreground">
             Atlas is using the last valid settings — config.toml has a problem
           </p>
-          <p className="text-[11px] text-text-secondary font-mono break-all">{configError}</p>
+          <p className="text-xs text-secondary-foreground font-mono break-all">{configError}</p>
           <div className="flex gap-2">
             <button
               type="button"
               onClick={() => void openConfigFile()}
               className={cn(
-                "h-7 rounded-md px-2.5 text-[11px] font-medium border border-border-default bg-bg-elevated",
-                "text-text-primary hover:bg-bg-hover transition-colors",
+                "h-7 rounded-md px-2.5 text-xs font-medium border border-border bg-card",
+                "text-foreground hover:bg-element-hover transition-colors",
               )}
             >
               Open config
@@ -288,8 +342,8 @@ function GeneralSettings() {
               onClick={() => void recreateConfigDefaults()}
               disabled={resettingConfig}
               className={cn(
-                "h-7 rounded-md px-2.5 text-[11px] font-medium border border-border-default bg-bg-elevated",
-                "text-text-primary hover:bg-bg-hover transition-colors",
+                "h-7 rounded-md px-2.5 text-xs font-medium border border-border bg-card",
+                "text-foreground hover:bg-element-hover transition-colors",
                 "disabled:opacity-50 disabled:cursor-not-allowed",
               )}
             >
@@ -298,12 +352,36 @@ function GeneralSettings() {
             <button
               type="button"
               onClick={clearConfigError}
-              className="h-7 rounded-md px-2.5 text-[11px] font-medium text-text-secondary hover:text-text-primary transition-colors"
+              className="h-7 rounded-md px-2.5 text-xs font-medium text-secondary-foreground hover:text-foreground transition-colors"
             >
               Dismiss
             </button>
           </div>
         </div>
+      )}
+      <SettingRow
+        label="Interface zoom"
+        description="Scales the whole interface — text, icons and spacing together."
+      >
+        <ZoomControl />
+      </SettingRow>
+      {isMac && (
+        <SettingRow
+          label="App icon"
+          description="Changes the icon in the Dock, Finder and Launchpad. Only the default is live Liquid Glass; the others are fixed renders of theirs."
+        >
+          <select
+            value={settings.appIcon}
+            onChange={(e) => updateSettings({ appIcon: e.target.value })}
+            className="h-7 rounded-md border border-[var(--border)] bg-[var(--card)] px-2 text-xs text-[var(--foreground)] outline-none"
+          >
+            {APP_ICONS.map((icon) => (
+              <option key={icon.id} value={icon.id}>
+                {icon.label}
+              </option>
+            ))}
+          </select>
+        </SettingRow>
       )}
       <SettingRow
         label="Enter to send"
@@ -314,78 +392,30 @@ function GeneralSettings() {
           onChange={(next) => updateSettings({ enterToSend: next })}
         />
       </SettingRow>
-      <SectionTitle
-        title="Terminal notifications"
-        subtitle="Be told when a command finishes or wants input, wherever you are in Atlas"
-      />
       <SettingRow
-        label="Terminal notifications"
-        description="A command that fails, runs longer than the threshold, or asks for input raises an item in the notification center, a toast when its terminal is off screen, and a macOS notification when Atlas is in the background. Nothing fires while you are looking at that terminal."
+        label="Keep awake while an agent is working"
+        description={
+          isWindows
+            ? "Keep-awake is currently not supported on Windows."
+            : `Keeps your ${isMac ? "Mac" : "computer"} from sleeping while an agent is working. The display can still turn off.`
+        }
       >
         <Toggle
-          checked={settings.terminalNotifications}
-          onChange={(next) => updateSettings({ terminalNotifications: next })}
+          checked={!isWindows && settings.keepAwakeWhileRunning}
+          disabled={isWindows}
+          onChange={(next) => updateSettings({ keepAwakeWhileRunning: next })}
         />
       </SettingRow>
-      <SettingRow
-        label="Notify on success after"
-        description="A command that succeeds faster than this stays quiet. Failures always notify (below)."
-      >
-        <select
-          value={String(settings.terminalNotifyMinDurationMs)}
-          disabled={!settings.terminalNotifications}
-          onChange={(e) => updateSettings({ terminalNotifyMinDurationMs: Number(e.target.value) })}
-          className="h-7 rounded-md border border-[var(--border-default)] bg-[var(--bg-elevated)] px-2 text-[11px] text-[var(--text-primary)] outline-none disabled:opacity-40"
-        >
-          <option value="5000">5 seconds</option>
-          <option value="10000">10 seconds</option>
-          <option value="30000">30 seconds</option>
-          <option value="60000">1 minute</option>
-          <option value="300000">5 minutes</option>
-        </select>
-      </SettingRow>
-      <SettingRow
-        label="Notify on failure"
-        description="A non-zero exit code notifies regardless of how long the command ran. Ctrl-C is not a failure."
-      >
-        <Toggle
-          checked={settings.terminalNotifyOnFailure}
-          disabled={!settings.terminalNotifications}
-          onChange={(next) => updateSettings({ terminalNotifyOnFailure: next })}
-        />
-      </SettingRow>
-      <SettingRow
-        label="Notify when input is needed"
-        description="A password prompt, a terminal bell, or a program's own notification (OSC 9 / 777) while the terminal is not on screen."
-      >
-        <Toggle
-          checked={settings.terminalNotifyOnAttention}
-          disabled={!settings.terminalNotifications}
-          onChange={(next) => updateSettings({ terminalNotifyOnAttention: next })}
-        />
-      </SettingRow>
-      <SettingRow
-        label="macOS notifications"
-        description="Also raise a system notification when the Atlas window is not focused."
-      >
-        <Toggle
-          checked={settings.terminalNotifyNative}
-          disabled={!settings.terminalNotifications}
-          onChange={(next) => updateSettings({ terminalNotifyNative: next })}
-        />
-      </SettingRow>
-      <SettingRow label="Sound" description="Play a short chime with terminal notifications.">
-        <Toggle
-          checked={settings.terminalNotifySound}
-          disabled={!settings.terminalNotifications}
-          onChange={(next) => updateSettings({ terminalNotifySound: next })}
-        />
-      </SettingRow>
+      <NotificationsSettings />
 
       <SectionTitle title="Behaviour" subtitle="Files, logs and the editor" />
       <SettingRow
-        label="Auto-add .atlas to .gitignore"
-        description="When you open a git-tracked project, Atlas adds `.atlas/` to the project's .gitignore (creating one if needed). Atlas keeps its caches and state in `.atlas/` — keeping it out of version control is almost always what you want. No-op on non-git projects."
+        label={devProfile ? `Keep ${atlasDir} out of git` : `Auto-add ${atlasDir} to .gitignore`}
+        description={
+          devProfile
+            ? `When you open a git-tracked project, ${productName} lists \`${atlasDir}/\` in the repository's local .git/info/exclude, so it stays out of version control without editing the project's .gitignore. ${productName} keeps its caches and state in \`${atlasDir}/\`. No-op on non-git projects.`
+            : `When you open a git-tracked project, Atlas adds \`${atlasDir}/\` to the project's .gitignore (creating one if needed). Atlas keeps its caches and state in \`${atlasDir}/\` — keeping it out of version control is almost always what you want. No-op on non-git projects.`
+        }
       >
         <Toggle
           checked={settings.autoAddAtlasGitignore}
@@ -394,7 +424,7 @@ function GeneralSettings() {
       </SettingRow>
       <SettingRow
         label="Show hidden files"
-        description="Show dotfiles and dot-directories (e.g. `.git`, `.atlas`, `.env`) in the file tree. Default ON so nothing is silently hidden. Turn off for a cleaner tree that only lists your project's visible files."
+        description={`Show dotfiles and dot-directories (e.g. \`.git\`, \`${atlasDir}\`, \`.env\`) in the file tree. Default ON so nothing is silently hidden. Turn off for a cleaner tree that only lists your project's visible files.`}
       >
         <Toggle
           checked={settings.showHiddenFiles}
@@ -408,6 +438,15 @@ function GeneralSettings() {
         <Toggle
           checked={settings.gitBlameInline}
           onChange={(next) => updateSettings({ gitBlameInline: next })}
+        />
+      </SettingRow>
+      <SettingRow
+        label="Auto-fetch from remote"
+        description="Quietly run `git fetch` for the open project when it opens, when Atlas regains focus, and every few minutes, so the Pull badge shows what the remote has. It only updates remote-tracking branches — it never pulls, merges, or touches your files."
+      >
+        <Toggle
+          checked={settings.gitAutoFetch}
+          onChange={(next) => updateSettings({ gitAutoFetch: next })}
         />
       </SettingRow>
       <SettingRow
@@ -453,8 +492,8 @@ function GeneralSettings() {
           type="button"
           onClick={() => useFeedbackStore.getState().actions.openPanel("settings")}
           className={cn(
-            "h-7 rounded-md px-2.5 text-[11px] font-medium border border-border-default bg-bg-elevated",
-            "text-text-primary hover:bg-bg-hover transition-colors",
+            "h-7 rounded-md px-2.5 text-xs font-medium border border-border bg-card",
+            "text-foreground hover:bg-element-hover transition-colors",
           )}
         >
           Send feedback
@@ -470,6 +509,60 @@ function GeneralSettings() {
         />
       </SettingRow>
       <SettingRow
+        label="Switching agents in a chat"
+        description="What picking another agent does once a chat has a conversation. Start over switches in place with a clean chat. New tab keeps the conversation on screen and opens the new agent beside it. Hand off switches in place and attaches the conversation to your next message, so the new agent picks up where the last one stopped. Every conversation stays in your history."
+      >
+        <select
+          value={settings.agentSwitchBehavior}
+          onChange={(e) =>
+            updateSettings({
+              agentSwitchBehavior: e.target.value as AppSettings["agentSwitchBehavior"],
+            })
+          }
+          className="h-7 rounded-md border border-[var(--border)] bg-[var(--card)] px-2 text-xs text-[var(--foreground)] outline-none"
+        >
+          <option value="reset">Start over</option>
+          <option value="new-tab">New tab</option>
+          <option value="handoff">Hand off</option>
+        </select>
+      </SettingRow>
+      <SettingRow
+        label="Save to memory before switching agents"
+        description="Before you switch agents in a chat that has a conversation, the agent you are leaving is sent /remember, so it saves its decisions and findings to shared memory, and the switch waits for it. Only for agents that offer /remember. Costs one turn per switch; you can switch right away from the notice."
+      >
+        <Toggle
+          checked={settings.rememberBeforeSwitch}
+          onChange={(next) => updateSettings({ rememberBeforeSwitch: next })}
+        />
+      </SettingRow>
+      <SettingRow
+        label="Mirror CLAUDE.md and .claude/rules into AGENTS.md"
+        description="For agents that read AGENTS.md. When on, Atlas keeps a marked block in the active project's AGENTS.md with CLAUDE.md and every .claude/rules file, rewritten as they change, and creates AGENTS.md if there is none. Your own text outside the block is never changed. Turning it off removes the block. Hooks and permission lists are not instructions and are not copied."
+      >
+        <Toggle
+          checked={settings.instructionSync}
+          onChange={(next) => updateSettings({ instructionSync: next })}
+        />
+      </SettingRow>
+      <SettingRow
+        label="Let Atlas Agent navigate the app"
+        description="Atlas Agent can open files at a line, switch tabs and panels, fill in a chat message and type a command into a terminal for you to run. It never switches projects, sends a message for you or presses Enter. Each action shows in the chat and the Logs panel."
+      >
+        <Toggle
+          checked={settings.agentUiNavigation}
+          onChange={(next) => updateSettings({ agentUiNavigation: next })}
+        />
+      </SettingRow>
+      <SettingRow
+        label="Let Atlas Agent act in your organisation"
+        description="In a Project bound to the cloud, Atlas Agent can read your organisation's recorded sessions, comments, members and conversations, and act there as you. Anything that reaches another person asks you first. Each action shows in the chat and the Logs panel."
+      >
+        <Toggle
+          checked={settings.agentOrgAccess}
+          onChange={(next) => updateSettings({ agentOrgAccess: next })}
+        />
+      </SettingRow>
+      <SettingRow
         label="Atlas CLI"
         description={`Adds an \`atlas\` command to your shell — type \`atlas .\` in any terminal to open the current folder as a project. Refreshed automatically on every launch so an older copy never lingers. ${cliInstalledLine}.`}
       >
@@ -478,8 +571,8 @@ function GeneralSettings() {
           onClick={() => void installCli()}
           disabled={installing}
           className={cn(
-            "h-7 rounded-md px-2.5 text-[11px] font-medium border border-border-default bg-bg-elevated",
-            "text-text-primary hover:bg-bg-hover transition-colors",
+            "h-7 rounded-md px-2.5 text-xs font-medium border border-border bg-card",
+            "text-foreground hover:bg-element-hover transition-colors",
             "disabled:opacity-50 disabled:cursor-not-allowed",
           )}
         >
@@ -495,8 +588,8 @@ function GeneralSettings() {
           onClick={() => void updatePricing()}
           disabled={pricingLoading}
           className={cn(
-            "h-7 rounded-md px-2.5 text-[11px] font-medium border border-border-default bg-bg-elevated",
-            "text-text-primary hover:bg-bg-hover transition-colors",
+            "h-7 rounded-md px-2.5 text-xs font-medium border border-border bg-card",
+            "text-foreground hover:bg-element-hover transition-colors",
             "disabled:opacity-50 disabled:cursor-not-allowed",
           )}
         >
@@ -507,122 +600,72 @@ function GeneralSettings() {
   );
 }
 
-type AppearanceTab = "theme" | "accent";
-
-const APPEARANCE_TABS: { id: AppearanceTab; label: string }[] = [
-  { id: "accent", label: "Interface Theme" },
-  { id: "theme", label: "Editor Theme" },
-];
-
-function AppearanceSettings() {
-  const settings = useProjectStore.use.settings();
-  const { updateSettings } = useProjectStore.use.actions();
-  const [tab, setTab] = useState<AppearanceTab>("accent");
+/** Interface zoom stepper. Also reachable anywhere via the view.zoom* shortcuts. */
+function ZoomControl() {
+  const settings = useSettingsStore.use.settings();
+  const { updateSettings } = useSettingsStore.use.actions();
 
   const scalePct = Math.round(settings.uiScale * 100);
   const setScale = (next: number) => updateSettings({ uiScale: clampScale(next) });
-  const zoomHints = [
-    useActionShortcut("view.zoomIn")?.label,
-    useActionShortcut("view.zoomOut")?.label,
-    useActionShortcut("view.zoomReset")?.label,
-  ].filter(Boolean);
+  const zoomInKeys = useActionShortcut("view.zoomIn")?.label;
+  const zoomOutKeys = useActionShortcut("view.zoomOut")?.label;
+  const zoomResetKeys = useActionShortcut("view.zoomReset")?.label;
 
   return (
-    <div className="flex h-full min-h-0 flex-col">
-      {/* Header — Skills-style underline tabs (no title), zoom on the right. */}
-      <div className="flex h-[29px] shrink-0 items-center gap-1 border-b border-border-default px-2">
-        {APPEARANCE_TABS.map((t) => (
-          <UnderlineTab
-            key={t.id}
-            active={tab === t.id}
-            onClick={() => setTab(t.id)}
-            label={t.label}
-          />
-        ))}
-
-        {/* Interface zoom — right-aligned control (like Skills' scope control). */}
-        <div
-          className="ml-auto flex items-center gap-1 pr-0.5"
-          title={zoomHints.length ? `Interface zoom (${zoomHints.join(" / ")})` : "Interface zoom"}
+    <div className="flex items-center gap-1">
+      <Hint label="Zoom out" shortcut={zoomOutKeys}>
+        <button
+          type="button"
+          onClick={() => setScale(settings.uiScale - SCALE_STEP)}
+          disabled={settings.uiScale <= MIN_SCALE}
+          className={cn(
+            "flex h-6 w-6 items-center justify-center rounded-full border border-border text-secondary-foreground",
+            "hover:bg-element-hover hover:text-foreground transition-colors cursor-pointer",
+            "disabled:opacity-40 disabled:cursor-not-allowed",
+          )}
         >
-          <button
-            type="button"
-            aria-label="Zoom out"
-            onClick={() => setScale(settings.uiScale - SCALE_STEP)}
-            disabled={settings.uiScale <= MIN_SCALE}
-            className={cn(
-              "flex h-6 w-6 items-center justify-center rounded-full border border-border-default text-text-secondary",
-              "hover:bg-bg-hover hover:text-text-primary transition-colors cursor-pointer",
-              "disabled:opacity-40 disabled:cursor-not-allowed",
-            )}
-          >
-            <Minus size={12} />
-          </button>
-          <button
-            type="button"
-            onClick={() => setScale(DEFAULT_SCALE)}
-            title="Reset to 100%"
-            className="h-6 min-w-[44px] rounded-md px-1.5 text-[11px] font-medium tabular-nums text-text-secondary hover:bg-bg-hover hover:text-text-primary transition-colors cursor-pointer"
-          >
-            {scalePct}%
-          </button>
-          <button
-            type="button"
-            aria-label="Zoom in"
-            onClick={() => setScale(settings.uiScale + SCALE_STEP)}
-            disabled={settings.uiScale >= MAX_SCALE}
-            className={cn(
-              "flex h-6 w-6 items-center justify-center rounded-full border border-border-default text-text-secondary",
-              "hover:bg-bg-hover hover:text-text-primary transition-colors cursor-pointer",
-              "disabled:opacity-40 disabled:cursor-not-allowed",
-            )}
-          >
-            <Plus size={12} />
-          </button>
-        </div>
-      </div>
-
-      <div className="min-h-0 flex-1">
-        {tab === "theme" ? <CodeEditorThemesSettings /> : <AtlasThemesSettings />}
-      </div>
+          <Minus size={12} />
+        </button>
+      </Hint>
+      <Hint label="Reset to 100%" shortcut={zoomResetKeys}>
+        <button
+          type="button"
+          onClick={() => setScale(DEFAULT_SCALE)}
+          className="h-6 min-w-[44px] rounded-md px-1.5 text-xs font-medium tabular-nums text-secondary-foreground hover:bg-element-hover hover:text-foreground transition-colors cursor-pointer"
+        >
+          {scalePct}%
+        </button>
+      </Hint>
+      <Hint label="Zoom in" shortcut={zoomInKeys}>
+        <button
+          type="button"
+          onClick={() => setScale(settings.uiScale + SCALE_STEP)}
+          disabled={settings.uiScale >= MAX_SCALE}
+          className={cn(
+            "flex h-6 w-6 items-center justify-center rounded-full border border-border text-secondary-foreground",
+            "hover:bg-element-hover hover:text-foreground transition-colors cursor-pointer",
+            "disabled:opacity-40 disabled:cursor-not-allowed",
+          )}
+        >
+          <Plus size={12} />
+        </button>
+      </Hint>
     </div>
   );
 }
 
-/** Underline tab — copied from the Skills header (`skills-and-packs.tsx`). */
-function UnderlineTab({
-  active,
-  onClick,
-  label,
-}: {
-  active: boolean;
-  onClick: () => void;
-  label: string;
-}) {
-  return (
-    <button
-      type="button"
-      onClick={onClick}
-      className={cn(
-        "flex h-[29px] items-center gap-1.5 px-2.5 text-[11px] font-medium transition-colors border-b-2 -mb-px cursor-pointer",
-        active
-          ? "text-text-primary border-b-[var(--accent-primary)]"
-          : "text-text-secondary hover:text-text-primary border-b-transparent",
-      )}
-    >
-      {label}
-    </button>
-  );
-}
-
 function UpdatesSettings() {
-  const settings = useProjectStore.use.settings();
-  const { updateSettings } = useProjectStore.use.actions();
+  const settings = useSettingsStore.use.settings();
+  const { updateSettings } = useSettingsStore.use.actions();
   const phase = useUpdaterStore.use.phase();
   const version = useUpdaterStore.use.version();
   const progress = useUpdaterStore.use.progress();
   const { beginApply, setError } = useUpdaterStore.use.actions();
   const [checking, setChecking] = useState(false);
+  // A dev-profile build (`bun run dev:app`) never fetches or installs a
+  // release: the backend refuses both, since the release would replace the
+  // installed Atlas. Say so instead of offering a button that can only fail.
+  const { dev: devProfile, productName } = useAppProfile();
 
   const downloading = phase === "downloading";
   const ready = phase === "ready" || phase === "applying";
@@ -650,19 +693,21 @@ function UpdatesSettings() {
 
   // The "Check for updates" row swaps its control based on the live phase:
   // downloading → progress; ready → Restart button; else → Check now.
-  const control = ready ? (
+  const control = devProfile ? (
+    <span className="text-xs text-muted-foreground">Off in {productName}</span>
+  ) : ready ? (
     <button
       type="button"
       onClick={restart}
       className={cn(
-        "h-7 rounded-md px-2.5 text-[11px] font-medium",
-        "bg-[var(--text-primary)] text-[var(--bg-base)] hover:opacity-90 transition-opacity",
+        "h-7 rounded-md px-2.5 text-xs font-medium",
+        "bg-[var(--foreground)] text-[var(--background)] hover:opacity-90 transition-opacity",
       )}
     >
       Restart to update
     </button>
   ) : downloading ? (
-    <span className="text-[11px] text-text-tertiary tabular-nums">
+    <span className="text-xs text-muted-foreground tabular-nums">
       {progress != null ? `Downloading ${Math.round(progress * 100)}%` : "Preparing…"}
     </span>
   ) : (
@@ -671,8 +716,8 @@ function UpdatesSettings() {
       onClick={() => void checkNow()}
       disabled={checking}
       className={cn(
-        "h-7 rounded-md px-2.5 text-[11px] font-medium border border-border-default bg-bg-elevated",
-        "text-text-primary hover:bg-bg-hover transition-colors",
+        "h-7 rounded-md px-2.5 text-xs font-medium border border-border bg-card",
+        "text-foreground hover:bg-element-hover transition-colors",
         "disabled:opacity-50 disabled:cursor-not-allowed",
       )}
     >
@@ -685,7 +730,13 @@ function UpdatesSettings() {
       <SectionTitle title="Updates" subtitle="How Atlas keeps itself up to date" />
       <SettingRow
         label="Automatic updates"
-        description="Check for a newer version in the background and download it automatically. Updates are Apple-signed and notarized; Atlas verifies the signature before installing. Turn off to never check or download."
+        description={
+          isWindows
+            ? "Check for a newer version in the background and download the installer automatically. Windows asks for permission before it is installed. Turn off to never check or download."
+            : isLinux
+              ? "Check for a newer version in the background. On Linux, update via your package manager (AUR, deb, rpm) or download the latest release asset. Turn off to never check."
+              : "Check for a newer version in the background and download it automatically. Updates are Apple-signed and notarized; Atlas verifies the signature before installing. Turn off to never check or download."
+        }
       >
         <Toggle
           checked={settings.autoUpdate}
@@ -704,9 +755,11 @@ function UpdatesSettings() {
       <SettingRow
         label={ready ? `Update ready${version ? ` (${version})` : ""}` : "Check for updates"}
         description={
-          ready
-            ? "A new version has been downloaded and verified. Restart now, or it'll be applied automatically the next time you quit Atlas."
-            : "Check now regardless of the automatic-update setting. Newer versions download in the background; you'll be prompted to restart when ready."
+          devProfile
+            ? "This is a source build (bun run dev:app). It never downloads or installs a release, because that would replace your installed Atlas — update the installed app from itself."
+            : ready
+              ? "A new version has been downloaded and verified. Restart now, or it'll be applied automatically the next time you quit Atlas."
+              : "Check now regardless of the automatic-update setting. Newer versions download in the background; you'll be prompted to restart when ready."
         }
       >
         {control}
@@ -719,103 +772,19 @@ function AboutSettings() {
   return (
     <div className="space-y-4">
       <SectionTitle title="About" subtitle="Atlas IDE" />
-      <div className="rounded-lg border border-border-default bg-bg-secondary p-4 space-y-2">
+      <div className="rounded-lg border border-border bg-card p-4 space-y-2">
         <div className="flex items-center gap-2">
           <AtlasIcon size={40} className="rounded-xl" />
           <div>
-            <p className="text-sm font-semibold text-text-primary">Atlas</p>
-            <p className="text-[10px] text-text-tertiary">v0.3.2 — The second brain IDE</p>
+            <p className="text-sm font-semibold text-foreground">Atlas</p>
+            <p className="text-2xs text-muted-foreground">v0.4.0 — The second brain IDE</p>
           </div>
         </div>
-        <p className="text-[11px] text-text-secondary leading-relaxed pt-2">
+        <p className="text-xs text-secondary-foreground leading-relaxed pt-2">
           Built with Tauri, React, and Rust. An everything app for agentic development — from code
           analysis to task management, research, and AI orchestration.
         </p>
       </div>
     </div>
-  );
-}
-
-function SectionTitle({ title, subtitle }: { title: string; subtitle: string }) {
-  return (
-    <div>
-      <h2 className="text-sm font-semibold text-text-primary">{title}</h2>
-      <p className="text-[11px] text-text-tertiary mt-0.5">{subtitle}</p>
-    </div>
-  );
-}
-
-function SettingRow({
-  label,
-  description,
-  children,
-}: {
-  label: string;
-  description: string;
-  children: React.ReactNode;
-}) {
-  return (
-    <div className="flex items-start justify-between gap-4">
-      <div>
-        <p className="text-[12px] font-medium text-text-primary">{label}</p>
-        <p className="text-[10px] text-text-tertiary mt-0.5">{description}</p>
-      </div>
-      <div className="shrink-0">{children}</div>
-    </div>
-  );
-}
-
-/**
- * Toggle — controlled OR uncontrolled. If `checked` is provided the parent
- * owns the state and `onChange` is fired on click; otherwise we keep
- * internal state seeded by `defaultChecked` (original behavior).
- */
-export function Toggle({
-  defaultChecked = false,
-  checked,
-  onChange,
-  disabled = false,
-}: {
-  defaultChecked?: boolean;
-  checked?: boolean;
-  onChange?: (next: boolean) => void;
-  /** For a sub-setting whose parent is off — dimmed and inert, but still
-   *  showing its own stored value rather than lying about it. */
-  disabled?: boolean;
-}) {
-  const [internal, setInternal] = useState(defaultChecked);
-  const isControlled = checked !== undefined;
-  const value = isControlled ? checked : internal;
-  const apply = (next: boolean) => {
-    if (disabled) return;
-    if (!isControlled) setInternal(next);
-    onChange?.(next);
-  };
-  // shadcn/Radix switch proportions: the track has a 2px transparent
-  // border so its inner content area is exactly the thumb's size,
-  // making the thumb fill vertically and animate translate-x-0 → -x-4
-  // edge to edge. The thumb flips color when ON because Atlas's accent
-  // is pure white — a white-on-white thumb would disappear.
-  return (
-    <button
-      onClick={() => apply(!value)}
-      role="switch"
-      aria-checked={value}
-      disabled={disabled}
-      className={cn(
-        "relative inline-flex h-5 w-9 shrink-0 items-center",
-        "rounded-full border-2 border-transparent transition-colors",
-        disabled ? "opacity-40 cursor-not-allowed" : "cursor-pointer",
-        value ? "bg-[var(--accent-primary)]" : "bg-[var(--bg-elevated)]",
-      )}
-    >
-      <span
-        className={cn(
-          "pointer-events-none block h-4 w-4 rounded-full shadow-[0_1px_3px_rgba(0,0,0,0.45)]",
-          "transition-transform duration-150",
-          value ? "translate-x-4 bg-[var(--bg-base)]" : "translate-x-0 bg-white",
-        )}
-      />
-    </button>
   );
 }

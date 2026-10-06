@@ -1,20 +1,26 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import * as Popover from "@radix-ui/react-popover";
+import { RailGlyph } from "@/ui/animated-icon";
+import { Popover } from "@base-ui/react/popover";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { Check, Filter, PanelLeft, RefreshCw, Search, X } from "lucide-react";
+import { Check, Filter, RefreshCw, Search, X } from "lucide-react";
+
+import { toast } from "sonner";
 
 import { copyText } from "@/lib/clipboard";
 
 import { useLayoutStore } from "@/features/layout/stores/layout-store";
 import { useOrgStore } from "@/features/organisations/stores/org-store";
-import { useActiveOrgWorkspaces } from "@/features/workspaces/lib/org-scope";
-import { BranchLine, GitDot, NumStatPill } from "@/features/workspaces/components/git-summary";
-import { useWorkspaceGitStore } from "@/features/workspaces/stores/workspace-git-store";
+import { useActiveOrgProjects } from "@/features/projects/lib/org-scope";
+import { BranchLine, GitDot, NumStatPill } from "@/features/projects/components/git-summary";
+import { useProjectGitStore } from "@/features/projects/stores/project-git-store";
 import { cn } from "@/lib/utils";
+import { Hint } from "@/ui/tooltip";
+import { HintGroup, HintItem } from "@/ui/hint-group";
 
-import { useArtifactsStore } from "../stores/artifacts-store";
-import type { BoardSession, SessionDetail as Detail } from "../types";
+import { useSessionComments } from "../lib/use-session-comments";
+import { useArtifactsStore, type OpenSession } from "../stores/artifacts-store";
+import type { BoardPage, BoardSession, SessionDetail as Detail } from "../types";
 import {
   activeFacetCount,
   facetMatches,
@@ -27,15 +33,19 @@ import {
   type FacetSelection,
   type GroupPeriod,
 } from "../lib/board";
+import { boardKey } from "../lib/board-key";
 import { clearDetailCache, readCachedDetail, writeCachedDetail } from "../lib/detail-cache";
+import { readSessionDetail } from "../lib/read-session-detail";
 import { DockButton, DOCK_ACTIVE, DOCK_TRIGGER, HeaderDock } from "./header-dock";
 import { CheckpointsPicker } from "./checkpoints-picker";
 import { ExportButton } from "./export-button";
 import { SessionChatPanel } from "./session-chat-panel";
+import { SessionCommentsPanel } from "./session-comments-panel";
 import { SessionDetail } from "./session-detail";
 import { TimelineInbox } from "./timeline-inbox";
 import { TimelineResults } from "./timeline-results";
 import { TimelineSidebar } from "./timeline-sidebar";
+import { DetailSkeleton } from "./timeline-skeleton";
 
 /**
  * Is this re-read structurally the same Session we already have?
@@ -62,11 +72,13 @@ function sameDetail(a: Detail | null | undefined, b: Detail | null): boolean {
 function sameBoard(a: BoardSession[], b: BoardSession[]): boolean {
   if (a.length !== b.length) return false;
   if (a.length === 0) return true;
-  const sig = (s: BoardSession | undefined) => `${s?.id}|${s?.updatedAt}`;
+  // By board key, not id: a Session re-sent to another Project keeps its id,
+  // and a row that changed Project must still re-render.
+  const sig = (s: BoardSession) => `${boardKey(s)}|${s.updatedAt}`;
   return (
     sig(a[0]) === sig(b[0]) &&
     sig(a[a.length - 1]) === sig(b[b.length - 1]) &&
-    a.every((s, i) => s.id === b[i].id && s.updatedAt === b[i].updatedAt)
+    a.every((s, i) => sig(s) === sig(b[i]))
   );
 }
 
@@ -74,9 +86,18 @@ function sameBoard(a: BoardSession[], b: BoardSession[]): boolean {
 const CHAT_WIDTH = 420;
 
 /**
+ * The comments half.
+ *
+ * Narrower than the chat by design rather than by symmetry: a chat answer
+ * carries code blocks and diagrams, a comment carries a sentence or two. At the
+ * chat's width the rows were mostly empty and the transcript paid for it.
+ */
+const COMMENTS_WIDTH = 294;
+
+/**
  * The card's inset from the tab's edges, in px.
  *
- * Measured against the workspace rail's card rather than chosen: side by side
+ * Measured against the project rail's card rather than chosen: side by side
  * with the switcher, 6px read as a visibly wider gutter on the Timeline. The
  * divider and the header row are both positioned against this constant, so the
  * three cannot drift apart.
@@ -106,7 +127,7 @@ function PeriodPill({
   onChange: (next: GroupPeriod) => void;
 }) {
   return (
-    <div className="flex h-7 shrink-0 items-center rounded-full border border-[var(--border-default)] p-0.5">
+    <div className="flex h-7 shrink-0 items-center rounded-full border border-[var(--border)] p-0.5">
       {PERIODS.map((p) => (
         <button
           key={p.value}
@@ -114,10 +135,10 @@ function PeriodPill({
           aria-pressed={period === p.value}
           onClick={() => onChange(p.value)}
           className={cn(
-            "flex h-full cursor-pointer items-center rounded-full px-2 text-[11px] leading-none outline-none transition-colors",
+            "flex h-full cursor-pointer items-center rounded-full px-2 text-xs leading-none outline-none transition-colors",
             period === p.value
-              ? "bg-[var(--bg-active)] font-medium text-[var(--text-primary)]"
-              : "text-[var(--text-tertiary)] hover:text-[var(--text-secondary)]",
+              ? "bg-[var(--atlas-element-active)] font-medium text-[var(--foreground)]"
+              : "text-[var(--muted-foreground)] hover:text-[var(--secondary-foreground)]",
           )}
         >
           {p.label}
@@ -145,12 +166,12 @@ const BOARD_LIMIT = 500;
  *
  * * **Reads are sequenced, not cancelled.** `invoke` has no abort, so every
  *   read carries a sequence number and only the newest may write state. A slow
- *   read for Workspace A landing after a switch to B must not overwrite B's
+ *   read for Project A landing after a switch to B must not overwrite B's
  *   sessions with A's.
  * * **`detail` is tri-state.** `undefined` = a read is in flight, `null` = the
  *   store answered and the Session does not exist. The first version collapsed
  *   the two and left a permanent spinner on any null result.
- * * **Everything resets on a Workspace switch** — open Session included. The
+ * * **Everything resets on a Project switch** — open Session included. The
  *   old Session id means nothing in the new store.
  * * **Refresh is event-driven first** (`atlas:git-changed`, which the watcher
  *   emits on every repo move), with a 15 s poll as the fallback for capture
@@ -158,13 +179,46 @@ const BOARD_LIMIT = 500;
  *   actually visible.
  */
 
+/** The board row a Session was opened from, if it is still on the board. */
+function boardRowFor(sessions: BoardSession[], open: OpenSession): BoardSession | undefined {
+  const k = openKeyOf(open);
+  return sessions.find((s) => boardKey(s) === k);
+}
+
+/** The {@link boardKey} of the open Session — the same Session id can be on the
+ *  board once per Project, so the id alone does not say which row is open. */
+function openKeyOf(open: OpenSession): string {
+  return boardKey({
+    id: open.sessionId,
+    projectPath: open.projectPath,
+    remoteProjectId: open.remoteProjectId ?? null,
+  });
+}
+
+/**
+ * A Session with its summary but not yet its timeline.
+ *
+ * The board row already carries every field the masthead reads, so this costs
+ * nothing and removes the whole round trip from the first paint. It is only
+ * ever shown with `entriesPending`, which is what stops the empty `entries`
+ * being read as "this Session recorded nothing".
+ */
+function shellDetail(row: BoardSession): Detail {
+  return {
+    summary: row,
+    entries: [],
+    counts: { prompts: 0, responses: 0, thinking: 0, toolCalls: 0, checkpoints: 0 },
+    tools: [],
+  };
+}
+
 export function ArtifactsPanel() {
   // Every project in the active Organisation, not just the open one: the board
   // answers "what has been happening in our code", which does not stop at the
   // folder that happens to be focused.
-  const projects = useActiveOrgWorkspaces();
+  const projects = useActiveOrgProjects();
   const activeOrganisationId = useOrgStore.use.activeOrganisationId();
-  // A stable key, so the read effect does not re-fire on unrelated workspace
+  // A stable key, so the read effect does not re-fire on unrelated project
   // mutations (a rename, a pin) that leave the set of paths unchanged.
   const projectPaths = useMemo(() => projects.map((w) => w.path).sort(), [projects]);
   // Joined only for a cheap dependency comparison — never split back
@@ -173,6 +227,16 @@ export function ArtifactsPanel() {
   const projectsKey = projectPaths.join("\n");
 
   const [sessions, setSessions] = useState<BoardSession[]>([]);
+  /**
+   * The timeline is still arriving for the Session on screen.
+   *
+   * Distinct from `detail === undefined` (nothing to show yet) because the
+   * masthead is painted from the board row the instant it is clicked, ahead of
+   * the entries. Without this the shell's empty `entries` would render
+   * "Nothing was recorded in this session." — which is exactly what a Session
+   * with genuinely no rows says, and the two must not look alike.
+   */
+  const [entriesPending, setEntriesPending] = useState(false);
   /** `undefined` while a detail read is in flight; `null` when not found. */
   const [detail, setDetail] = useState<Detail | null | undefined>(undefined);
   // Held in the store, not here: this panel unmounts on every tab switch, and
@@ -180,10 +244,17 @@ export function ArtifactsPanel() {
   const open = useArtifactsStore.use.open();
   const projectFilter = useArtifactsStore.use.projectFilter();
   const { openSession, setProjectFilter } = useArtifactsStore.use.actions();
+
+  // Comments on the open Session, or `null` when it is not shared — which is
+  // what hides every comment affordance rather than showing empty threads. The
+  // hook resolves the Organisation's roster itself, so the account no longer
+  // has to be plumbed through here.
+  const comments = useSessionComments(open?.remoteProjectId ?? null, open?.sessionId ?? null);
   // Stable identity for the memo'd board rows — an inline arrow here would
   // re-render all ~500 of them on every panel render.
   const onOpenRow = useCallback(
-    (sessionId: string, projectPath: string) => openSession({ sessionId, projectPath }),
+    (sessionId: string, projectPath: string, remoteProjectId?: string | null) =>
+      openSession({ sessionId, projectPath, remoteProjectId: remoteProjectId ?? null }),
     [openSession],
   );
   /** True once the first board read has landed. */
@@ -210,10 +281,84 @@ export function ArtifactsPanel() {
    *  three only narrow what is already on screen. */
   const [selection, setSelection] = useState<FacetSelection>(NO_FACETS);
   const [error, setError] = useState<string | null>(null);
+  /** Why the open Session could not be read. Scoped to its own pane — see the
+   *  `readDetail` catch. */
+  const [detailError, setDetailError] = useState<string | null>(null);
+  /**
+   * A synced Organisation's first server read has not landed.
+   *
+   * The board is local-first, so for a synced Organisation the first read comes
+   * back with nothing and `loaded` flips true — which rendered "No sessions
+   * captured yet" for the moment before the remote rows arrived. The local-only
+   * case never had this, because its first read is the whole answer.
+   */
+  const [cloudPending, setCloudPending] = useState(false);
+  /**
+   * Which Organisation we have already told the user about.
+   *
+   * The board re-reads on every capture and git event and on a fifteen-second
+   * ticker, and all of them carry the failure flag — so without this the notice
+   * would reappear every few seconds for as long as the connection is down.
+   * Cleared on an org switch and on a successful read, so a later failure is
+   * reported again.
+   */
+  const cloudFailureToldFor = useRef<string | null>(null);
+
+  const retryCloud = useCallback(() => {
+    void invoke<boolean>("artifacts_cloud_refresh")
+      .then((ok) => {
+        if (ok) toast.success("Cloud sessions loaded.");
+        // A failed retry re-arms the notice rather than raising a second one
+        // on top of the first — `refresh` below will report it again.
+        else cloudFailureToldFor.current = null;
+      })
+      .catch(() => {
+        cloudFailureToldFor.current = null;
+      })
+      .finally(() => void refreshRef.current?.());
+  }, []);
+
+  const reportCloudFailure = useCallback(
+    (failed: boolean, orgId: string | null) => {
+      if (!failed) {
+        cloudFailureToldFor.current = null;
+        return;
+      }
+      if (cloudFailureToldFor.current === orgId) return;
+      cloudFailureToldFor.current = orgId;
+      toast.error("Couldn't load this Organisation's shared sessions.", {
+        id: "timeline-cloud-failed",
+        description: "Showing the sessions recorded on this machine.",
+        action: { label: "Retry", onClick: retryCloud },
+      });
+    },
+    [retryCloud],
+  );
+
+  /** `refresh` is defined below and the retry needs it; a ref keeps the two
+   *  from having to be declared in dependency order. */
+  const refreshRef = useRef<(() => void) | null>(null);
   /** Whether the grounded chat occupies the right half of the open Session.
    *  Local, and reset when the Session changes: a chat about the Session you
    *  just left is not a chat about the one you just opened. */
-  const [chatOpen, setChatOpen] = useState(false);
+  /**
+   * Which side panel is open, if any.
+   *
+   * One slot, not two. The pane is ~420px and both panels are *about* the
+   * transcript — opening them together would leave the record narrower than the
+   * thing being discussed.
+   */
+  const [sidePanel, setSidePanel] = useState<"chat" | "comments" | null>(null);
+  /**
+   * The open panel's width, held through the close animation.
+   *
+   * Reading it from `sidePanel` directly would snap the aside to the other
+   * panel's width on the frame it closes, because `null` has no width of its
+   * own — the slide-out would jump before it moved.
+   */
+  const lastPanelWidth = useRef(CHAT_WIDTH);
+  if (sidePanel) lastPanelWidth.current = sidePanel === "chat" ? CHAT_WIDTH : COMMENTS_WIDTH;
+  const panelWidth = lastPanelWidth.current;
 
   /** True while the divider is being dragged — keeps it lit past the pointer. */
   const [resizing, setResizing] = useState(false);
@@ -246,11 +391,34 @@ export function ArtifactsPanel() {
   /** Same, for the detail read. */
   const detailSeq = useRef(0);
 
-  // The read cache holds timelines from the *previous* set of projects. Nothing
-  // reads it across a switch — the open Session is dropped too — but a stale
-  // Workspace's entries surviving in memory is exactly the leak this subsystem
-  // is careful about everywhere else.
-  useEffect(() => clearDetailCache, [activeOrganisationId]);
+  // Switching Organisation closes whatever was open and drops the cache.
+  //
+  // The comment here used to *claim* the open Session was dropped. It was not,
+  // and that was the bug behind the red banner over the board: a Session from
+  // the previous tenant stayed open, its detail re-read against the new one,
+  // and a Project the new Organisation has never heard of came back as a
+  // failure. A Session belongs to the Organisation it was opened in.
+  //
+  // Keyed on a ref rather than firing on mount, because a Session opened from
+  // outside — the git panel's history, a Checkpoint — is set *before* this
+  // panel mounts, and clearing on the first run would close it again.
+  const lastOrg = useRef(activeOrganisationId);
+  useEffect(() => {
+    if (lastOrg.current === activeOrganisationId) return;
+    lastOrg.current = activeOrganisationId;
+    clearDetailCache();
+    openSession(null);
+    setError(null);
+    // Back to the loading state rather than the previous tenant's rows. The
+    // refresh below repopulates; leaving them up means one Organisation's work
+    // is briefly on screen under another's name.
+    setSessions([]);
+    setLoaded(false);
+    setCloudPending(true);
+    // A new tenant gets its own notice if it also fails.
+    cloudFailureToldFor.current = null;
+    toast.dismiss("timeline-cloud-failed");
+  }, [activeOrganisationId, openSession]);
 
   // A filter naming a project that is no longer open would hide everything with
   // no way back, so it is dropped rather than left dangling.
@@ -266,10 +434,13 @@ export function ArtifactsPanel() {
       // rows it returns, so filtering afterwards would show only this project's
       // share of the newest few hundred; asking for one project reads its
       // history whole.
-      const rows = await invoke<BoardSession[]>("artifacts_board", {
+      const page = await invoke<BoardPage>("artifacts_board", {
         projects: projectFilter ? [projectFilter] : projectPaths,
       });
       if (seq !== listSeq.current) return; // a newer read owns the state now
+      const rows = page.sessions;
+      setCloudPending(page.cloudPending);
+      reportCloudFailure(page.cloudFailed, activeOrganisationId);
       // Same-data bailout, the list-side sibling of `sameDetail`: the poll and
       // the capture/git events re-read even when nothing changed, and an
       // unconditional setSessions handed a fresh array identity to the memo'd
@@ -285,7 +456,10 @@ export function ArtifactsPanel() {
     }
     // `projectsKey` stands in for `projectPaths`: same content, stable identity.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [projectsKey, projectFilter]);
+  }, [projectsKey, projectFilter, reportCloudFailure, activeOrganisationId]);
+
+  // The retry needs `refresh` and is declared above it — see `refreshRef`.
+  refreshRef.current = refresh;
 
   useEffect(() => {
     void refresh();
@@ -325,18 +499,19 @@ export function ArtifactsPanel() {
 
   // Opening a Session reads its full timeline; the list row does not carry it.
   // The read goes to the store of the project the row came from, which is not
-  // necessarily the Workspace currently open.
+  // necessarily the Project currently open.
   const readDetail = useCallback(
     (showLoading: boolean) => {
       if (!open) return;
       const seq = ++detailSeq.current;
       if (showLoading) setDetail(undefined);
-      invoke<Detail | null>("artifacts_session", {
-        projectPath: open.projectPath,
-        sessionId: open.sessionId,
-      })
+      // Local store first, the server second — see `readSessionDetail` for
+      // why the second step is not optional: a teammate's Session in a Project
+      // this machine has bound carries a local `projectPath` and is not in the
+      // local store.
+      readSessionDetail(open)
         .then((result) => {
-          if (result) writeCachedDetail(open.projectPath, open.sessionId, result);
+          if (result) writeCachedDetail(open, result);
           if (seq !== detailSeq.current) return;
           // Keep the previous object when nothing changed.
           //
@@ -346,11 +521,19 @@ export function ArtifactsPanel() {
           // in a structurally identical object invalidates every memo in the
           // tree and re-renders every mounted row — hundreds of them, mid-scroll.
           setDetail((current) => (sameDetail(current, result) ? current : result));
+          setEntriesPending(false);
+          setDetailError(null);
         })
         .catch((e) => {
           if (seq === detailSeq.current) {
+            // A failed read over a painted shell must not leave the masthead up
+            // with an empty timeline under it — that reads as "no rows".
             setDetail(null);
-            setError(String(e));
+            setEntriesPending(false);
+            // Deliberately NOT `setError`: that banner spans the whole board,
+            // and one Session failing to open says nothing about the other
+            // four hundred. It goes in the pane that failed.
+            setDetailError(String(e));
           }
         });
     },
@@ -358,26 +541,46 @@ export function ArtifactsPanel() {
   );
 
   useEffect(() => {
-    setChatOpen(false);
+    setSidePanel(null);
   }, [open?.sessionId]);
 
   useEffect(() => {
     if (!open) {
       detailSeq.current += 1;
       setDetail(undefined);
+      setEntriesPending(false);
       return;
     }
     // A Session read once this browsing session paints from memory and refreshes
     // behind the content. Stepping back to the board and into the next row is
     // the normal way to use the Timeline, and re-reading SQLite for a *finished*
     // Session put a blank panel in front of that every time.
-    const cached = readCachedDetail(open.projectPath, open.sessionId);
+    const cached = readCachedDetail(open);
     if (cached) {
       setDetail(cached);
+      setEntriesPending(false);
       readDetail(false);
       return;
     }
+
+    // Nothing cached — but the board row this was opened from IS the summary,
+    // so the masthead can paint now and the timeline can arrive after it. That
+    // matters most for a Session held on the server, where the read is a paged
+    // network walk rather than a local SQLite hit and the whole pane would
+    // otherwise sit on "Reading the session…" for seconds.
+    const row = boardRowFor(sessions, open);
+    if (row) {
+      setDetail(shellDetail(row));
+      setEntriesPending(true);
+      readDetail(false);
+      return;
+    }
+
+    setEntriesPending(false);
     readDetail(true);
+    // `sessions` is read for the opening frame only — re-running this effect on
+    // every board refresh would re-paint the shell over a loaded timeline.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open, readDetail]);
 
   // A live Session keeps growing while it is open — piggyback the detail
@@ -469,9 +672,9 @@ export function ArtifactsPanel() {
     // the whole reason for the colour step and the rounded tops — a header that
     // shares its background with the list under it needs a rule to separate
     // them, and a curve says it better than a line.
-    <div className="flex h-full min-h-0 flex-col bg-[var(--bg-elevated-2)]">
+    <div className="flex h-full min-h-0 flex-col bg-[var(--card)]">
       {error && (
-        <p className="shrink-0 bg-[var(--status-error-muted)] px-4 py-1.5 text-[11px] text-[var(--status-error)]">
+        <p className="shrink-0 bg-[var(--atlas-status-error-background)] px-4 py-1.5 text-xs text-[var(--atlas-status-error-foreground)]">
           {error}
         </p>
       )}
@@ -479,7 +682,7 @@ export function ArtifactsPanel() {
       {/* Chrome, then one card.
        *
        * The two headers share a row above it and the two panes share the card
-       * below it — the same recipe as the workspace rail and team chat: a
+       * below it — the same recipe as the project rail and team chat: a
        * near-black surface inset on the sides and bottom, its edge carried by a
        * hairline ring with a soft shadow behind it. One card rather than two
        * keeps the earlier rule intact for free: only the OUTER corners are
@@ -493,7 +696,7 @@ export function ArtifactsPanel() {
             are known here.
             
             30% of the way from the default border to the strong one — the
-            hairline at `--border-default` disappeared against the card's own
+            hairline at `--border` disappeared against the card's own
             ring at this length.
 
             `z-40` because it has to beat the pane's own overlays, not merely
@@ -512,14 +715,14 @@ export function ArtifactsPanel() {
             className={cn(
               "absolute top-0 z-40 w-px cursor-col-resize transition-colors",
               "after:absolute after:inset-y-0 after:-left-[3px] after:-right-[3px] after:content-['']",
-              resizing && "bg-[var(--accent-primary)]",
+              resizing && "bg-[var(--primary)]",
             )}
             style={{
               bottom: CARD_INSET,
               left: CARD_INSET + sidebarWidth,
               background: resizing
                 ? undefined
-                : "color-mix(in srgb, var(--border-strong) 30%, var(--border-default))",
+                : "color-mix(in srgb, var(--atlas-border-strong) 30%, var(--border))",
             }}
           />
         )}
@@ -533,7 +736,7 @@ export function ArtifactsPanel() {
                 className="flex h-full shrink-0 items-center gap-2 px-1.5"
                 style={{ width: sidebarWidth }}
               >
-                <span className="flex-1 truncate text-[12px] font-semibold text-[var(--text-primary)]">
+                <span className="flex-1 truncate text-sm font-semibold text-[var(--foreground)]">
                   Timeline
                 </span>
                 {/* Grain. It changes what the rows under it are grouped INTO,
@@ -551,17 +754,20 @@ export function ArtifactsPanel() {
                 {/* Maximise: tuck the nav away so the Session has the whole
                     tab. The same control brings it back — one button, one
                     place, whichever state you are in. */}
-                <DockButton
-                  label={showSidebar ? "Maximise session" : "Show timeline"}
-                  active={!showSidebar}
-                  onClick={toggleTimelineSidebar}
-                >
-                  <PanelLeft size={13} />
-                </DockButton>
+                <HintGroup>
+                  <DockButton
+                    label={showSidebar ? "Maximise session" : "Show timeline"}
+                    active={!showSidebar}
+                    onClick={toggleTimelineSidebar}
+                  >
+                    <RailGlyph open={showSidebar} size="md" />
+                  </DockButton>
+                </HintGroup>
                 <Breadcrumb
                   sessionId={open.sessionId}
                   title={detail?.summary.title ?? null}
                   projectPath={open.projectPath}
+                  remoteProjectId={open.remoteProjectId ?? null}
                   onBack={() => openSession(null)}
                 />
               </>
@@ -575,35 +781,43 @@ export function ArtifactsPanel() {
             <div className="ml-auto flex shrink-0 items-center">
               {/* One dock: act on the open Session, jump to a commit, scope
                   the board, re-read it. */}
+              {/* The dock belongs to whatever is on screen. Reading a Session,
+                  the only action about *it* is exporting it — a commit jumper,
+                  a board filter and a board reload are three controls for the
+                  list you just left, and they sat there implying otherwise. */}
               <HeaderDock>
-                {open && detail && <ExportButton detail={detail} />}
-                <CheckpointsPicker
-                  projects={projectFilter ? [projectFilter] : projectPaths}
-                  onOpen={(row) =>
-                    openSession({
-                      sessionId: row.sessionId,
-                      projectPath: row.projectPath,
-                      commitSha: row.commitSha,
-                    })
-                  }
-                />
-                {filterMenu}
-                <DockButton label="Reload timeline" onClick={() => void refresh()}>
-                  <RefreshCw size={12} className={cn(refreshing && "animate-spin")} />
-                </DockButton>
+                {open ? (
+                  detail && <ExportButton detail={detail} />
+                ) : (
+                  <>
+                    <CheckpointsPicker
+                      projects={projectFilter ? [projectFilter] : projectPaths}
+                      onOpen={(row) =>
+                        openSession({
+                          sessionId: row.sessionId,
+                          projectPath: row.projectPath,
+                          commitSha: row.commitSha,
+                        })
+                      }
+                    />
+                    {filterMenu}
+                    <DockButton label="Reload timeline" onClick={() => void refresh()}>
+                      <RefreshCw size={12} className={cn(refreshing && "animate-spin")} />
+                    </DockButton>
+                  </>
+                )}
               </HeaderDock>
             </div>
           </div>
         </div>
 
         <div
-          className="relative flex min-h-0 flex-1 overflow-hidden rounded-[10px] bg-[var(--bg-base)]"
+          // On a near-black panel a shadow has almost nothing to darken, so
+          // the ring carries the edge and the shadow only lifts the card.
+          className="relative flex min-h-0 flex-1 overflow-hidden rounded-lg bg-background shadow-lg ring-1 ring-border"
           style={{
             marginInline: CARD_INSET,
             marginBottom: CARD_INSET,
-            // On a near-black panel a shadow has almost nothing to darken, so
-            // the ring carries the edge and the shadow only lifts the card.
-            boxShadow: "0 0 0 1px rgba(255,255,255,0.08), 0 10px 28px rgba(0,0,0,0.6)",
           }}
         >
           {/* The nav. Mounted only when shown, and its width is set directly —
@@ -622,28 +836,37 @@ export function ArtifactsPanel() {
                   measures. */}
               <TimelineSidebar
                 sessions={scoped}
-                loading={!loaded}
+                // Still loading while the remote half is outstanding *and*
+                // there is nothing to show. Rows already on screen keep
+                // rendering through a refresh rather than flashing back to a
+                // skeleton.
+                // A synced Organisation waits for BOTH halves — the local rows
+                // alone are a partial board, and showing them first meant the
+                // list visibly rewrote itself a moment later. An Organisation
+                // with no cloud half is never pending, so it still paints as
+                // soon as the store answers.
+                loading={!loaded || cloudPending}
                 filtered={activeFacetCount(selection) > 0 || projectFilter !== null}
-                openId={open?.sessionId ?? null}
+                openKey={open ? openKeyOf(open) : null}
                 period={period}
                 onOpen={onOpenRow}
               />
               {/* Say what is being left out. A nav that silently stops at the
                *  newest few hundred reads as "this is everything". */}
               {capped && (
-                <p className="shrink-0 border-t border-[var(--border-subtle)] px-3 py-1.5 text-[11px] leading-snug text-[var(--text-tertiary)]">
+                <p className="shrink-0 border-t border-[var(--atlas-border-subtle)] px-3 py-1.5 text-xs leading-snug text-[var(--muted-foreground)]">
                   Showing the newest {BOARD_LIMIT} sessions — filter by project for a full history.
                 </p>
               )}
             </aside>
           )}
 
-          <main className="min-w-0 flex-1 bg-[var(--bg-surface)]">
+          <main className="min-w-0 flex-1 bg-[var(--background)]">
             {open ? (
               detail === undefined ? (
-                <Centered>Reading the session…</Centered>
+                <DetailSkeleton />
               ) : detail === null ? (
-                <NotFound onBack={() => openSession(null)} />
+                <NotFound reason={detailError} onBack={() => openSession(null)} />
               ) : (
                 // Two panes, animated. The chat's *width* is what transitions —
                 // sliding an overlay in would leave the detail at full width
@@ -654,32 +877,62 @@ export function ArtifactsPanel() {
                     <SessionDetail
                       detail={detail}
                       projectPath={open.projectPath}
+                      comments={comments}
+                      entriesPending={entriesPending}
+                      // Only when there is no local copy. A synced Session of
+                      // your own is on both sides, and the local blob read is
+                      // faster and works offline.
+                      remote={
+                        !open.projectPath && open.remoteProjectId
+                          ? { projectId: open.remoteProjectId, sessionId: open.sessionId }
+                          : null
+                      }
                       focusCommitSha={open.commitSha}
-                      chatOpen={chatOpen}
-                      onToggleChat={() => setChatOpen((v) => !v)}
+                      chatOpen={sidePanel === "chat"}
+                      onToggleChat={() =>
+                        setSidePanel((current) => (current === "chat" ? null : "chat"))
+                      }
+                      commentsOpen={sidePanel === "comments"}
+                      onToggleComments={() =>
+                        setSidePanel((current) => (current === "comments" ? null : "comments"))
+                      }
                     />
                   </div>
                   <aside
-                    className="atlas-split shrink-0 overflow-hidden border-l border-[var(--border-default)]"
-                    style={{ width: chatOpen ? CHAT_WIDTH : 0 }}
-                    aria-hidden={!chatOpen}
+                    className="atlas-split shrink-0 overflow-hidden border-l border-[var(--border)]"
+                    style={{ width: sidePanel ? panelWidth : 0 }}
+                    aria-hidden={sidePanel === null}
                   >
                     {/* Fixed inner width so the content does not reflow through
-                     *  the animation — a chat that re-wraps every frame while
-                     *  opening reads as a glitch, not a transition. */}
-                    <div style={{ width: CHAT_WIDTH }} className="h-full">
-                      {chatOpen && (
+                     *  the animation — a panel that re-wraps every frame while
+                     *  opening reads as a glitch, not a transition. It tracks
+                     *  the *last* panel shown, so closing animates out at the
+                     *  width it opened at rather than snapping first. */}
+                    <div style={{ width: panelWidth }} className="h-full">
+                      {sidePanel === "chat" && (
                         <SessionChatPanel
                           detail={detail}
                           projectPath={open.projectPath}
-                          onClose={() => setChatOpen(false)}
+                          onClose={() => setSidePanel(null)}
+                        />
+                      )}
+                      {sidePanel === "comments" && comments && (
+                        <SessionCommentsPanel
+                          detail={detail}
+                          comments={comments}
+                          onClose={() => setSidePanel(null)}
                         />
                       )}
                     </div>
                   </aside>
                 </div>
               )
-            ) : loaded && sessions.length === 0 ? (
+            ) : !loaded || cloudPending ? (
+              // The first board read. Without this the pane falls through to
+              // the "recent Sessions" inbox with nothing in it, which reads as
+              // an Organisation with no work rather than one still loading.
+              <DetailSkeleton />
+            ) : sessions.length === 0 ? (
               <NotEnabled />
             ) : narrowed ? (
               // Narrowed, so the question changed: not "which session next" but
@@ -716,8 +969,12 @@ export function ArtifactsPanel() {
  */
 function BoardSearch({ query, onQuery }: { query: string; onQuery: (q: string) => void }) {
   return (
-    <div className="flex h-7 w-[220px] min-w-0 shrink items-center gap-2 rounded-full border border-[var(--border-default)] bg-[var(--bg-base)] px-3 transition-colors focus-within:border-[var(--border-strong)]">
-      <Search size={13} strokeWidth={1.6} className="block shrink-0 text-[var(--text-tertiary)]" />
+    <div className="flex h-7 w-[220px] min-w-0 shrink items-center gap-2 rounded-full border border-[var(--border)] bg-[var(--background)] px-3 transition-colors focus-within:border-[var(--atlas-border-strong)]">
+      <Search
+        size={13}
+        strokeWidth={1.6}
+        className="block shrink-0 text-[var(--muted-foreground)]"
+      />
       <input
         value={query}
         onChange={(e) => onQuery(e.target.value)}
@@ -727,17 +984,18 @@ function BoardSearch({ query, onQuery }: { query: string; onQuery: (q: string) =
         placeholder="Search sessions…"
         spellCheck={false}
         aria-label="Search sessions"
-        className="min-w-0 flex-1 border-0 bg-transparent p-0 text-[11.5px] leading-none text-[var(--text-primary)] outline-none placeholder:text-[var(--text-tertiary)]"
+        className="min-w-0 flex-1 border-0 bg-transparent p-0 text-sm leading-none text-[var(--foreground)] outline-none placeholder:text-[var(--muted-foreground)]"
       />
       {query && (
-        <button
-          type="button"
-          onClick={() => onQuery("")}
-          aria-label="Clear search"
-          className="flex size-4 shrink-0 cursor-pointer items-center justify-center rounded-full text-[var(--text-tertiary)] transition-colors hover:text-[var(--text-primary)]"
-        >
-          <X size={11} />
-        </button>
+        <Hint label="Clear search">
+          <button
+            type="button"
+            onClick={() => onQuery("")}
+            className="flex size-4 shrink-0 cursor-pointer items-center justify-center rounded-full text-[var(--muted-foreground)] transition-colors hover:text-[var(--foreground)]"
+          >
+            <X size={11} />
+          </button>
+        </Hint>
       )}
     </div>
   );
@@ -766,11 +1024,14 @@ function Breadcrumb({
   sessionId,
   title,
   projectPath,
+  remoteProjectId,
   onBack,
 }: {
   sessionId: string;
   title: string | null;
   projectPath: string;
+  /** Set when the Session is on the server, which is what makes it linkable. */
+  remoteProjectId: string | null;
   onBack: () => void;
 }) {
   const [copied, setCopied] = useState(false);
@@ -784,28 +1045,40 @@ function Breadcrumb({
   return (
     <span
       title={projectPath}
-      className="flex min-w-0 items-center gap-1 text-[12px] text-[var(--text-tertiary)]"
+      className="flex min-w-0 items-center gap-1 text-sm text-[var(--muted-foreground)]"
     >
       <button
         type="button"
         onClick={onBack}
-        className="cursor-pointer rounded px-1 py-0.5 transition-colors hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)]"
+        className="cursor-pointer rounded px-1 py-0.5 transition-colors hover:bg-[var(--atlas-element-hover)] hover:text-[var(--foreground)]"
       >
         Sessions
       </button>
-      <span aria-hidden className="text-[var(--text-ghost)]">
+      <span aria-hidden className="text-[var(--atlas-text-disabled)]">
         /
       </span>
       <button
         type="button"
         onClick={() => {
-          void copyText(sessionId);
+          // A shared Session copies as a link a colleague can open; a local one
+          // has no address to give out, so it copies the id it always did. The
+          // id is useless to anyone else, which is exactly why it stops being
+          // the answer the moment there is a URL.
+          void (async () => {
+            const url = remoteProjectId
+              ? await invoke<string | null>("artifacts_cloud_session_url", {
+                  projectId: remoteProjectId,
+                  sessionId,
+                }).catch(() => null)
+              : null;
+            await copyText(url ?? sessionId);
+          })();
           setCopied(true);
           if (flash.current) clearTimeout(flash.current);
           flash.current = setTimeout(() => setCopied(false), 1200);
         }}
-        title={`Copy ${sessionId}`}
-        className="min-w-0 cursor-pointer truncate rounded px-1 py-0.5 text-[var(--text-secondary)] transition-colors hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)]"
+        title={remoteProjectId ? "Copy a link to this Session" : `Copy ${sessionId}`}
+        className="min-w-0 cursor-pointer truncate rounded px-1 py-0.5 text-[var(--secondary-foreground)] transition-colors hover:bg-[var(--atlas-element-hover)] hover:text-[var(--foreground)]"
       >
         {copied ? "copied" : label}
       </button>
@@ -824,7 +1097,7 @@ function Breadcrumb({
  * every option reads "0" the moment you type is a menu that cannot be used to
  * find anything.
  *
- * The PROJECT group carries the git detail the workspace sidebar shows — a dot
+ * The PROJECT group carries the git detail the project sidebar shows — a dot
  * for working-tree state and the current branch — because that is what tells two
  * projects called `api` and `api-v2` apart. The other groups are plain values,
  * and searching only filters projects, which is the only list long enough to
@@ -848,8 +1121,8 @@ function BoardFilter({
   onClear: () => void;
 }) {
   const [query, setQuery] = useState("");
-  const summaries = useWorkspaceGitStore.use.summaries();
-  const { ensure } = useWorkspaceGitStore.use.actions();
+  const summaries = useProjectGitStore.use.summaries();
+  const { ensure } = useProjectGitStore.use.actions();
 
   const active = activeFacetCount(selection) + (projectFilter ? 1 : 0);
   const q = query.trim().toLowerCase();
@@ -870,98 +1143,98 @@ function BoardFilter({
         for (const p of projects) ensure(p.path);
       }}
     >
-      <Popover.Trigger asChild>
-        <button
-          type="button"
-          aria-label={active ? `${active} filters active` : "Filter sessions"}
-          title={active ? `${active} filter${active === 1 ? "" : "s"} active` : "Filter sessions"}
-          className={cn(DOCK_TRIGGER, active && DOCK_ACTIVE)}
-        >
-          <Filter size={13} />
-          {/* A filter that is ON has to say so from the collapsed state — the
-              values are inside the menu, and a funnel that looks identical
-              either way hides an empty board behind a control nobody checks. */}
-          {active > 0 && (
-            <span className="absolute -right-1 -top-1 flex h-[13px] min-w-[13px] items-center justify-center rounded-full bg-[var(--text-primary)] px-[3px] font-mono text-[9px] font-medium text-[var(--text-inverse)]">
-              {active}
-            </span>
-          )}
-        </button>
-      </Popover.Trigger>
+      <HintItem
+        label={active ? `${active} filter${active === 1 ? "" : "s"} active` : "Filter sessions"}
+      >
+        <Popover.Trigger
+          render={
+            <button type="button" className={cn(DOCK_TRIGGER, active && DOCK_ACTIVE)}>
+              <Filter size={13} />
+              {/* A filter that is ON has to say so from the collapsed state — the
+                values are inside the menu, and a funnel that looks identical
+                either way hides an empty board behind a control nobody checks. */}
+              {active > 0 && (
+                <span className="absolute -right-1 -top-1 flex h-[13px] min-w-[13px] items-center justify-center rounded-full bg-[var(--foreground)] px-[3px] font-mono text-3xs font-medium text-[var(--primary-foreground)]">
+                  {active}
+                </span>
+              )}
+            </button>
+          }
+        />
+      </HintItem>
       <Popover.Portal>
-        <Popover.Content
-          side="bottom"
-          align="end"
-          sideOffset={4}
-          className="z-[var(--z-max)] flex max-h-[420px] w-[262px] origin-[var(--radix-popover-content-transform-origin)] flex-col overflow-hidden rounded-lg border border-[var(--border-default)] bg-[#000] shadow-xl data-[state=closed]:animate-scale-out data-[state=open]:animate-scale-in"
-        >
-          {active > 0 && (
-            <div className="flex h-[28px] shrink-0 items-center justify-between border-b border-[var(--border-default)] px-3">
-              <span className="font-mono text-[10px] text-[var(--text-tertiary)]">
-                {active} active
-              </span>
-              <Popover.Close asChild>
-                <button
-                  type="button"
-                  onClick={onClear}
-                  className="cursor-pointer font-mono text-[10px] uppercase tracking-[0.06em] text-[var(--text-secondary)] underline underline-offset-2 transition-colors hover:no-underline hover:text-[var(--text-primary)]"
-                >
-                  Clear all
-                </button>
-              </Popover.Close>
-            </div>
-          )}
-
-          <input
-            autoFocus
-            value={query}
-            onChange={(e) => setQuery(e.target.value)}
-            placeholder="Search projects…"
-            className="h-[28px] shrink-0 border-b border-[var(--border-default)] bg-transparent px-3 text-[11px] text-[var(--text-primary)] outline-none placeholder:text-[var(--text-tertiary)]"
-          />
-
-          <div className="hide-scrollbar min-h-0 flex-1 overflow-y-auto p-1">
-            <GroupLabel>Project</GroupLabel>
-            <Option
-              label="All projects"
-              count={projects.length}
-              selected={projectFilter === null}
-              onSelect={() => onProjectFilter(null)}
-            />
-            {shownProjects.map((p) => (
-              <Option
-                key={p.path}
-                label={p.name}
-                title={p.path}
-                selected={projectFilter === p.path}
-                onSelect={() => onProjectFilter(projectFilter === p.path ? null : p.path)}
-                lead={<GitDot summary={summaries[p.path]} />}
-                sub={<BranchLine summary={summaries[p.path]} className="mt-0.5" />}
-                trail={<NumStatPill summary={summaries[p.path]} />}
-              />
-            ))}
-            {shownProjects.length === 0 && (
-              <p className="px-2 py-2 text-center text-[11px] text-[var(--text-tertiary)]">
-                No project matches “{query.trim()}”.
-              </p>
+        <Popover.Positioner className="z-popover" side="bottom" align="end" sideOffset={4}>
+          <Popover.Popup className="flex max-h-[420px] w-[262px] origin-[var(--transform-origin)] flex-col overflow-hidden rounded-lg border border-[var(--border)] bg-popover shadow-xl data-closed:animate-scale-out data-open:animate-scale-in">
+            {active > 0 && (
+              <div className="flex h-[28px] shrink-0 items-center justify-between border-b border-[var(--border)] px-3">
+                <span className="font-mono text-2xs text-[var(--muted-foreground)]">
+                  {active} active
+                </span>
+                <Popover.Close
+                  render={
+                    <button
+                      type="button"
+                      onClick={onClear}
+                      className="cursor-pointer font-mono text-2xs uppercase tracking-[0.06em] text-[var(--secondary-foreground)] underline underline-offset-2 transition-colors hover:no-underline hover:text-[var(--foreground)]"
+                    >
+                      Clear all
+                    </button>
+                  }
+                />
+              </div>
             )}
 
-            {otherGroups.map((group) => (
-              <div key={group.key}>
-                <GroupLabel>{group.label}</GroupLabel>
-                {group.options.map((o) => (
-                  <Option
-                    key={`${group.key}:${o.value ?? "all"}`}
-                    label={o.label}
-                    count={o.count}
-                    selected={selection[group.key] === o.value}
-                    onSelect={() => onSelect(group.key, o.value)}
-                  />
-                ))}
-              </div>
-            ))}
-          </div>
-        </Popover.Content>
+            <input
+              autoFocus
+              value={query}
+              onChange={(e) => setQuery(e.target.value)}
+              placeholder="Search projects…"
+              className="h-[28px] shrink-0 border-b border-[var(--border)] bg-transparent px-3 text-xs text-[var(--foreground)] outline-none placeholder:text-[var(--muted-foreground)]"
+            />
+
+            <div className="hide-scrollbar min-h-0 flex-1 overflow-y-auto p-1">
+              <GroupLabel>Project</GroupLabel>
+              <Option
+                label="All projects"
+                count={projects.length}
+                selected={projectFilter === null}
+                onSelect={() => onProjectFilter(null)}
+              />
+              {shownProjects.map((p) => (
+                <Option
+                  key={p.path}
+                  label={p.name}
+                  title={p.path}
+                  selected={projectFilter === p.path}
+                  onSelect={() => onProjectFilter(projectFilter === p.path ? null : p.path)}
+                  lead={<GitDot summary={summaries[p.path]} />}
+                  sub={<BranchLine summary={summaries[p.path]} className="mt-0.5" />}
+                  trail={<NumStatPill summary={summaries[p.path]} />}
+                />
+              ))}
+              {shownProjects.length === 0 && (
+                <p className="px-2 py-2 text-center text-xs text-[var(--muted-foreground)]">
+                  No project matches “{query.trim()}”.
+                </p>
+              )}
+
+              {otherGroups.map((group) => (
+                <div key={group.key}>
+                  <GroupLabel>{group.label}</GroupLabel>
+                  {group.options.map((o) => (
+                    <Option
+                      key={`${group.key}:${o.value ?? "all"}`}
+                      label={o.label}
+                      count={o.count}
+                      selected={selection[group.key] === o.value}
+                      onSelect={() => onSelect(group.key, o.value)}
+                    />
+                  ))}
+                </div>
+              ))}
+            </div>
+          </Popover.Popup>
+        </Popover.Positioner>
       </Popover.Portal>
     </Popover.Root>
   );
@@ -969,7 +1242,7 @@ function BoardFilter({
 
 function GroupLabel({ children }: { children: React.ReactNode }) {
   return (
-    <p className="px-2 pb-1 pt-2 text-[10px] font-semibold uppercase tracking-[0.08em] text-[var(--text-tertiary)]">
+    <p className="px-2 pb-1 pt-2 text-2xs font-semibold uppercase tracking-[0.08em] text-[var(--muted-foreground)]">
       {children}
     </p>
   );
@@ -1000,16 +1273,18 @@ function Option({
       title={title}
       onClick={onSelect}
       className={cn(
-        "flex w-full cursor-pointer items-center gap-2 rounded px-2 py-1.5 text-left transition-colors hover:bg-[var(--bg-hover)]",
-        selected && "bg-[var(--bg-selected)]",
+        "flex w-full cursor-pointer items-center gap-2 rounded px-2 py-1.5 text-left transition-colors hover:bg-[var(--atlas-element-hover)]",
+        selected && "bg-[var(--atlas-element-selected)]",
       )}
     >
       {lead}
       <span className="min-w-0 flex-1">
         <span
           className={cn(
-            "block truncate text-[11px] leading-tight",
-            selected ? "font-medium text-[var(--text-primary)]" : "text-[var(--text-secondary)]",
+            "block truncate text-xs leading-tight",
+            selected
+              ? "font-medium text-[var(--foreground)]"
+              : "text-[var(--secondary-foreground)]",
           )}
         >
           {label}
@@ -1017,11 +1292,11 @@ function Option({
         {sub}
       </span>
       {selected ? (
-        <Check size={11} className="shrink-0 text-[var(--text-primary)]" />
+        <Check size={11} className="shrink-0 text-[var(--foreground)]" />
       ) : (
         (trail ??
         (count !== undefined ? (
-          <span className="shrink-0 font-mono text-[10px] tabular-nums text-[var(--text-tertiary)]">
+          <span className="shrink-0 font-mono text-2xs tabular-nums text-[var(--muted-foreground)]">
             {count}
           </span>
         ) : null))
@@ -1034,14 +1309,14 @@ function Option({
  * The first thing a new user sees.
  *
  * Not an error, and not three alarms — capture being off is the default state of
- * every Workspace, and the only useful thing to say about it is what turning it
+ * every Project, and the only useful thing to say about it is what turning it
  * on would give you.
  */
 function NotEnabled() {
   return (
     <div className="flex h-full flex-col items-center justify-center px-8 text-center">
-      <h2 className="text-[14px] font-medium text-[var(--text-primary)]">Nothing captured yet</h2>
-      <p className="mt-1.5 max-w-[420px] text-[12px] leading-relaxed text-[var(--text-tertiary)]">
+      <h2 className="text-md font-medium text-[var(--foreground)]">Nothing captured yet</h2>
+      <p className="mt-1.5 max-w-[420px] text-sm leading-relaxed text-[var(--muted-foreground)]">
         Turn capture on for a project and Atlas records what you asked, what the agent did, and
         which commits came out of it — stored on this machine, with secrets scrubbed before anything
         is written.
@@ -1049,7 +1324,7 @@ function NotEnabled() {
       {/* The control is deliberately not repeated here. Capture is per project
        *  and this board spans all of them, so the honest place to switch it on
        *  is the project pill in the titlebar, which names the one it applies to. */}
-      <p className="mt-3 max-w-[420px] text-[11px] text-[var(--text-ghost)]">
+      <p className="mt-3 max-w-[420px] text-xs text-[var(--atlas-text-disabled)]">
         Click the project name in the titlebar to turn it on.
       </p>
     </div>
@@ -1057,26 +1332,27 @@ function NotEnabled() {
 }
 
 /** The store answered: this Session does not exist (deleted, or another
- *  Workspace's id). Distinct from loading — a spinner here never resolves. */
-function NotFound({ onBack }: { onBack: () => void }) {
+ *  Project's id). Distinct from loading — a spinner here never resolves. */
+/**
+ * The open Session could not be read.
+ *
+ * `reason` separates "the row is gone" from "the read failed", which are not
+ * the same thing and used to look identical: a Session held on the server that
+ * this Organisation cannot reach was reported as deleted.
+ */
+function NotFound({ reason, onBack }: { reason: string | null; onBack: () => void }) {
   return (
     <div className="flex h-full flex-col items-center justify-center px-8 text-center">
-      <p className="text-[13px] text-[var(--text-secondary)]">This session no longer exists.</p>
+      <p className="text-base text-[var(--secondary-foreground)]">
+        {reason ?? "This session no longer exists."}
+      </p>
       <button
         type="button"
         onClick={onBack}
-        className="mt-3 cursor-pointer rounded-md border border-[var(--border-default)] px-3 py-1.5 text-[12px] text-[var(--text-secondary)] transition-colors hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)]"
+        className="mt-3 cursor-pointer rounded-md border border-[var(--border)] px-3 py-1.5 text-sm text-[var(--secondary-foreground)] transition-colors hover:bg-[var(--atlas-element-hover)] hover:text-[var(--foreground)]"
       >
         Back to sessions
       </button>
-    </div>
-  );
-}
-
-function Centered({ children }: { children: React.ReactNode }) {
-  return (
-    <div className="flex h-full items-center justify-center px-8 text-center text-[12px] text-[var(--text-tertiary)]">
-      {children}
     </div>
   );
 }

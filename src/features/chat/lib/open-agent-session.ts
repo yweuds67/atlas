@@ -2,8 +2,8 @@ import { toast } from "sonner";
 import { emit } from "@tauri-apps/api/event";
 import { useLayoutStore } from "@/features/layout/stores/layout-store";
 import { useChatStore } from "@/features/chat/stores/chat-store";
-import { useProjectStore } from "@/features/project/stores/project-store";
-import { useWorkspaceStore } from "@/features/workspaces/stores/workspace-store";
+import { useAppStore } from "@/features/app/stores/app-store";
+import { useProjectStore } from "@/features/projects/stores/project-store";
 import { ensureAgent, getAgentSync } from "./agents-api";
 import { errInfo } from "./agent-signin";
 import {
@@ -13,20 +13,21 @@ import {
   type SwitchableAgent,
 } from "@/types/agent";
 import { invalidateLoad } from "./load-tokens";
-import { resumeSessionFast } from "./resume-session";
+import { ResumeError, resumeSessionFast } from "./resume-session";
+import { applyModeOnResume, holdUnrestoredMode } from "./resume-mode";
 
 /** Active project root, preferring the legacy `currentProject` but falling back
- *  to the active workspace path (mirrors the sidebar's `cwd` resolution). */
+ *  to the active project path (mirrors the sidebar's `cwd` resolution). */
 function activeCwd(): string {
-  const project = useProjectStore.getState().currentProject;
-  const ws = useWorkspaceStore.getState();
-  return project?.path ?? ws.workspaces.find((w) => w.id === ws.activeWorkspaceId)?.path ?? "";
+  const project = useAppStore.getState().currentProject;
+  const ws = useProjectStore.getState();
+  return project?.path ?? ws.projects.find((w) => w.id === ws.activeProjectId)?.path ?? "";
 }
 
 /** Nudge the history sidebar to refetch all three agent session lists. The
  *  sidebar listens for the Tauri `atlas:sessions-changed` event (gated on cwd),
  *  so re-emit it from the frontend after a local mutation (e.g. abandoning a
- *  chat via New Chat) — Codex/Cersei have no file watcher and Claude's is async,
+ *  chat via New Chat) — Codex and the native agent have no file watcher and Claude's is async,
  *  so the just-abandoned conversation would otherwise not re-list immediately. */
 function refreshSessionLists(): void {
   const cwd = activeCwd();
@@ -55,10 +56,10 @@ function freshTabId(): string {
 
 /**
  * Open the agent chat focused on a specific ACP session, reloading its
- * transcript from disk. Assumes the target workspace is already active (the
- * caller switches workspaces first). Mirrors `session-sidebar.handleOpenAgent`'s
+ * transcript from disk. Assumes the target project is already active (the
+ * caller switches projects first). Mirrors `session-sidebar.handleOpenAgent`'s
  * load flow (focus-if-open, reuse-idle-tab-else-new) so it can be invoked from
- * anywhere (e.g. the workspace switcher's Chats section).
+ * anywhere (e.g. the project switcher's Chats section).
  */
 export async function openAgentSession({
   acpSessionId,
@@ -122,7 +123,7 @@ export async function openAgentSession({
 
   // If we're reusing the current tab in place and it held a real (messaged)
   // chat, that chat loses its live sidebar row on clear — refresh the disk
-  // lists so it re-lists from history immediately (Cersei/Codex have no watcher).
+  // lists so it re-lists from history immediately (the native agent and Codex have no watcher).
   const abandoningCurrent =
     reuse &&
     targetTabId === activeId &&
@@ -161,10 +162,22 @@ export async function openAgentSession({
     setAcpBinding(targetTabId, agent.agent_id, acpSessionId, cwd);
     // Restore live status + docked plan AFTER the bind (which clears the plan).
     hydrateSessionSnapshot(targetTabId, snapshot.status, snapshot.plan);
+    // This path seeded the mode pill from the stored preference but never told
+    // the agent, so the pill could read Bypass while the engine enforced Ask.
+    // Applied before `setResumePending(false)`, which is what releases a queued
+    // prompt: after it, the first turn can beat the mode to the agent.
+    await applyModeOnResume(
+      targetTabId,
+      { agent_id: agent.agent_id, session_id: acpSessionId },
+      snapshot,
+    );
     setTranscriptLoading(targetTabId, false);
     setResumePending(targetTabId, false);
   } catch (err) {
     setTranscriptLoading(targetTabId, false);
+    // The session is open but its mode was never applied: hold sends until a
+    // pick, before the gate below opens.
+    if (err instanceof ResumeError && err.stage === "snapshot") holdUnrestoredMode(targetTabId);
     setResumePending(targetTabId, false);
     // `errInfo`: the spawn/load commands in this path reject with a structured
     // `{message, kind}` that would render as "[object Object]".
@@ -189,9 +202,9 @@ export async function openAgentSession({
  * it instead (multiple chat tabs already coexist — `openAgentSession` spawns one
  * whenever the active chat is running). Only an IDLE chat is reset in place.
  *
- * `agent` binds the fresh session to a specific agent — the busy branch of the
- * ⌥/ cycle and the composer's agent switcher route here so switching agents
- * mid-turn spawns a new chat instead of killing the live one.
+ * `agent` binds the fresh session to a specific agent. Switching agents does
+ * not come through here: it always opens a new tab once the chat has a
+ * conversation (`openAgentChatInNewTab`), so it never resets one.
  */
 export function openNewAgentChat(agent?: SwitchableAgent): void {
   // This is a public entry point that WILL get wired as an event handler again
@@ -201,8 +214,8 @@ export function openNewAgentChat(agent?: SwitchableAgent): void {
   if (typeof agent !== "string") agent = undefined;
   const layout = useLayoutStore.getState();
   const chat = useChatStore.getState();
-  const { addTab, setActiveTab } = layout.actions;
-  const { clearSession, createSession, switchChatAgent } = chat.actions;
+  const { setActiveTab } = layout.actions;
+  const { clearSession, switchChatAgent } = chat.actions;
 
   const focus = (id: string) =>
     window.dispatchEvent(new CustomEvent("atlas:chat-focus", { detail: { tabId: id } }));
@@ -232,7 +245,22 @@ export function openNewAgentChat(agent?: SwitchableAgent): void {
   }
 
   // No chat tab open, or the current chat is mid-turn → fresh tab.
-  const id = `chat-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
+  openAgentChatInNewTab(agent);
+}
+
+/**
+ * Open a fresh agent chat in a NEW tab, never touching any existing chat.
+ *
+ * Switching agents on a chat that already has a conversation routes here, so
+ * the conversation stays on screen beside the new agent instead of being
+ * cleared out of its tab (a session is paired to one agent for its lifetime,
+ * so the new agent needs a session of its own either way).
+ */
+export function openAgentChatInNewTab(agent?: SwitchableAgent): void {
+  if (typeof agent !== "string") agent = undefined;
+  const { addTab, setActiveTab } = useLayoutStore.getState().actions;
+  const { createSession, switchChatAgent } = useChatStore.getState().actions;
+  const id = freshTabId();
   addTab({
     id,
     type: "chat",
@@ -244,5 +272,5 @@ export function openNewAgentChat(agent?: SwitchableAgent): void {
   createSession(id);
   if (agent) switchChatAgent(id, agent);
   setActiveTab(id);
-  focus(id);
+  window.dispatchEvent(new CustomEvent("atlas:chat-focus", { detail: { tabId: id } }));
 }

@@ -19,7 +19,10 @@ use anyhow::Result;
 use atlas_acp_thread::{AgentConnection, AgentId};
 use futures::future::BoxFuture;
 
-use crate::connection::{AcpConnection, AcpConnectionDefaults, AgentServerCommand, ThreadEventSink, RequestElicitationSink};
+use crate::connection::{
+    AcpConnection, AcpConnectionDefaults, AgentServerCommand, RequestElicitationSink,
+    ThreadEventSink,
+};
 
 /// Resolves the command for one installed agent.
 ///
@@ -35,6 +38,26 @@ pub trait ExternalAgentServer: Send + Sync {
 
     fn version(&self) -> Option<Arc<str>> {
         None
+    }
+
+    /// Bring a copy this agent already has on disk up to [`Self::version`],
+    /// without starting anything. `Ok(true)` when it installed something.
+    ///
+    /// For updates only: an agent never fetched stays lazy, so installing one
+    /// from the marketplace still costs nothing until its first chat. This is
+    /// what lets a registry bump download in the background, so the restart
+    /// that follows is instant instead of the next message waiting on npm.
+    /// The default has nothing on disk to update.
+    fn prefetch_update(&self) -> BoxFuture<'static, Result<bool>> {
+        Box::pin(async { Ok(false) })
+    }
+
+    /// Whether [`Self::prefetch_update`] would install something: a copy on
+    /// disk that is behind [`Self::version`]. Installs nothing itself — this is
+    /// how a running agent's staleness is found, since its update has to wait
+    /// for the restart. The default has nothing on disk to be behind.
+    fn update_pending(&self) -> BoxFuture<'static, bool> {
+        Box::pin(async { false })
     }
 }
 
@@ -71,10 +94,7 @@ impl AgentServerDelegate {
         }
     }
 
-    pub fn with_version_channel(
-        mut self,
-        tx: tokio::sync::watch::Sender<Option<String>>,
-    ) -> Self {
+    pub fn with_version_channel(mut self, tx: tokio::sync::watch::Sender<Option<String>>) -> Self {
         self.new_version_available = Some(tx);
         self
     }
@@ -103,6 +123,9 @@ pub struct ConnectOptions {
     /// connection will ever have, and without a sink they are raised into
     /// silence and the agent waits for an answer nobody was shown.
     pub request_elicitation_events: RequestElicitationSink,
+    /// Decides the MCP servers each session is handed (the memory tool
+    /// server, today). `None` hands every session an empty list.
+    pub session_mcp: Option<Arc<dyn crate::session_mcp::SessionMcpServers>>,
     pub client_name: &'static str,
     pub client_version: String,
 }
@@ -164,9 +187,10 @@ impl AgentServer for CustomAgentServer {
             let mut extra_env = load_proxy_env();
             extra_env.extend(env_quirks(&agent_id));
 
-            let server = delegate.server.clone().ok_or_else(|| {
-                anyhow::anyhow!("no command resolver for agent `{agent_id}`")
-            })?;
+            let server = delegate
+                .server
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("no command resolver for agent `{agent_id}`"))?;
             let command = server.get_command(Vec::new(), extra_env).await?;
 
             let connection = AcpConnection::stdio(
@@ -179,7 +203,8 @@ impl AgentServer for CustomAgentServer {
                 options.client_name,
                 options.client_version,
             )
-            .await?;
+            .await?
+            .with_session_mcp(options.session_mcp);
 
             Ok(Arc::new(connection) as Arc<dyn AgentConnection>)
         })
@@ -237,6 +262,15 @@ const GEMINI_AGENT_ID: &str = "gemini";
 /// Each is a fix for how that CLI behaves, not a capability decision — capability
 /// questions are answered by what the agent advertises at `initialize`.
 pub fn env_quirks(agent_id: &AgentId) -> HashMap<String, String> {
+    env_quirks_from(agent_id, |key| std::env::var(key).ok())
+}
+
+/// [`env_quirks`] against an explicit environment, so the pass-through can be
+/// tested without mutating the process's own.
+pub fn env_quirks_from(
+    agent_id: &AgentId,
+    host_env: impl Fn(&str) -> Option<String>,
+) -> HashMap<String, String> {
     let mut env = HashMap::new();
 
     match agent_id.as_str() {
@@ -246,10 +280,14 @@ pub fn env_quirks(agent_id: &AgentId) -> HashMap<String, String> {
             env.insert("ANTHROPIC_API_KEY".to_owned(), String::new());
         }
         // Passed through explicitly because the CLI reads them from its own
-        // environment, which a spawned child does not inherit selectively.
+        // environment. The spawn inherits the host's today, so this is what
+        // keeps them there if it ever stops doing so. These are the two names
+        // codex's auth reads (`CODEX_API_KEY_ENV_VAR`, `OPENAI_API_KEY_ENV_VAR`
+        // in `vendor/atlas-engine/login/src/auth/manager.rs`); Zed's `custom.rs`
+        // spells the second `OPEN_AI_API_KEY`, which nothing reads.
         CODEX_AGENT_ID => {
-            for key in ["CODEX_API_KEY", "OPEN_AI_API_KEY"] {
-                if let Ok(value) = std::env::var(key) {
+            for key in ["CODEX_API_KEY", "OPENAI_API_KEY"] {
+                if let Some(value) = host_env(key) {
                     env.insert(key.to_owned(), value);
                 }
             }

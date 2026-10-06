@@ -60,6 +60,20 @@ const NEEDS: ProviderNeed[] = [
     phrases: ["openrouter api key"],
   },
   {
+    provider: "orcarouter",
+    label: "OrcaRouter",
+    consoleHint: "orcarouter.ai",
+    envVars: ["ORCAROUTER_API_KEY", "ORCA_ROUTER_API_KEY", "ORCA_API_KEY"],
+    phrases: ["orcarouter api key", "orca router api key"],
+  },
+  {
+    provider: "cheaperinference",
+    label: "Cheaper Inference",
+    consoleHint: "cheaperinference.com/signup",
+    envVars: ["CHEAPER_INFERENCE_API_KEY", "CHEAPERINFERENCE_API_KEY"],
+    phrases: ["cheaper inference api key", "cheaperinference api key"],
+  },
+  {
     provider: "xai",
     label: "xAI",
     consoleHint: "console.x.ai",

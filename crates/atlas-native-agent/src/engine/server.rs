@@ -1,10 +1,10 @@
 //! The launcher for the native agent, on the ported engine.
 //!
 //! The only implementation of `AgentServer` for the native agent. It was one of
-//! two while the port was being proved; the Cersei one is gone (#54), and what
+//! two while the port was being proved; the previous native one is gone (#54), and what
 //! made the swap invisible was that both answered to the same agent id.
 //!
-//! Like the Cersei one, `connect` starts no process — the engine runs in this
+//! Like the previous native one, `connect` starts no process — the engine runs in this
 //! one (ADR-0004) — and ignores the delegate, because there is no command to
 //! resolve and no binary to download.
 
@@ -15,14 +15,14 @@ use agent_client_protocol::schema::v1 as acp;
 use anyhow::Result;
 use atlas_acp_thread::{AgentConnection, AgentId};
 use atlas_agent_servers::{AgentServer, AgentServerDelegate, ConnectOptions};
-use codex_login::auth::ExternalAuth;
+use atlas_engine_login::auth::ExternalAuth;
 use futures::future::BoxFuture;
 use futures::FutureExt;
 
 use crate::engine::catalog_cache::{CatalogueFetcher, GatewayCatalogueFetcher};
 use crate::engine::config::EngineSettings;
 use crate::engine::connection::EngineConnection;
-use crate::CERSEI_AGENT_ID;
+use crate::ATLAS_AGENT_ID;
 
 /// The native agent, on the ported engine.
 #[derive(Clone)]
@@ -35,12 +35,6 @@ pub struct EngineAgentServer {
     /// — the Phase 2 dev provider, which resolves a key from the environment.
     external_auth: Option<Arc<dyn ExternalAuth>>,
     default_mode: Option<acp::SessionModeId>,
-    /// Retrieval for `search_memory`, when the caller supplies one directly.
-    ///
-    /// `None` falls back to whatever the host registered, so a test can pass
-    /// its own without global state and the app does not have to thread one
-    /// through a `cfg`-gated constructor.
-    memory_search: Option<crate::engine::memory::MemorySearch>,
     /// How the model catalogue is fetched (ADR-0007).
     ///
     /// `None` builds the gateway fetcher at connect time, over the registered
@@ -55,21 +49,12 @@ impl EngineAgentServer {
             settings,
             external_auth: None,
             default_mode: None,
-            memory_search: None,
             catalogue: None,
         }
     }
 
     pub fn with_catalogue(mut self, catalogue: Arc<dyn CatalogueFetcher>) -> Self {
         self.catalogue = Some(catalogue);
-        self
-    }
-
-    pub fn with_memory_search(
-        mut self,
-        memory_search: crate::engine::memory::MemorySearch,
-    ) -> Self {
-        self.memory_search = Some(memory_search);
         self
     }
 
@@ -89,13 +74,13 @@ impl EngineAgentServer {
 }
 
 impl AgentServer for EngineAgentServer {
-    /// The same id the Cersei path occupies.
+    /// The native agent's stored id.
     ///
     /// Deliberate, and load-bearing: the stored agent id is a storage key
     /// (D7 / CONTEXT.md), so a thread recorded before the switch still resolves
     /// after it. Minting a new id here would orphan every existing native row.
     fn agent_id(&self) -> AgentId {
-        AgentId::new(CERSEI_AGENT_ID)
+        AgentId::new(ATLAS_AGENT_ID)
     }
 
     fn connect(
@@ -110,14 +95,17 @@ impl AgentServer for EngineAgentServer {
         // no credential.
         let external_auth = self.external_auth.clone().or_else(|| {
             crate::engine::auth::registered_token_source().map(|source| {
-                Arc::new(crate::engine::auth::AtlasExternalAuth::new(source)) as Arc<dyn ExternalAuth>
+                Arc::new(crate::engine::auth::AtlasExternalAuth::new(source))
+                    as Arc<dyn ExternalAuth>
             })
         });
-        let default_mode = self.default_mode.clone().or_else(|| options.defaults.mode.clone());
-        let memory_search = self
-            .memory_search
+        let default_mode = self
+            .default_mode
             .clone()
-            .or_else(crate::engine::memory::registered_search);
+            .or_else(|| options.defaults.mode.clone());
+        // The host's MCP servers (the memory tool server) reach the engine
+        // the same way they reach every ACP agent: offered per session.
+        let session_mcp = options.session_mcp.clone();
         let thread_events = options.thread_events.clone();
         let mut settings = self.settings.clone();
         if let Some(root) = options.root_dir.clone() {
@@ -138,7 +126,7 @@ impl AgentServer for EngineAgentServer {
                 thread_events,
                 external_auth,
                 default_mode,
-                memory_search,
+                session_mcp,
                 catalogue,
             )
             .await?;
@@ -166,7 +154,7 @@ mod tests {
         EngineAgentServer::new(EngineSettings::new(
             EngineHome::at("/tmp/atlas-engine-test"),
             EngineProvider::dev("dev", "https://example.invalid/v1", None),
-            Some("gpt-5-codex".to_string()),
+            Some("test-model".to_string()),
             PathBuf::from("/tmp"),
         ))
     }
@@ -174,13 +162,12 @@ mod tests {
     #[test]
     fn the_agent_id_is_the_storage_key_the_history_was_written_under() {
         // Not a name. Every recorded thread resolves through this string, so
-        // changing it is a data migration rather than a rename — which is why
-        // it survived the deletion of the path it was named after (D7).
-        assert_eq!(server().agent_id().as_str(), CERSEI_AGENT_ID);
+        // changing it is a data migration rather than a rename (ADR-0011).
+        assert_eq!(server().agent_id().as_str(), ATLAS_AGENT_ID);
         assert_eq!(
-            CERSEI_AGENT_ID, "cersei",
+            ATLAS_AGENT_ID, "atlas-agent",
             "the stored id is a storage key, not a name — every recorded thread \
-             resolves through it, so it outlives the retirement of the name (D7)",
+             resolves through it, and the frontend's NATIVE_AGENT_ID mirrors it",
         );
     }
 
@@ -215,5 +202,4 @@ mod tests {
             "and finds one at connect time",
         );
     }
-
 }

@@ -38,13 +38,18 @@ import {
   FolderGit2,
   GitBranch,
   Hash,
+  Layers,
   MessageSquare,
+  MessageSquareQuote,
+  MessagesSquare,
   Scale,
   SquareSlash,
+  User,
   Zap,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { shortPath } from "@/lib/paths";
+import { timeAgo } from "@/lib/time-ago";
 import { Kbd } from "@/ui/kbd";
 
 import {
@@ -63,7 +68,7 @@ import { SKILLS_CHANGED_EVENT } from "@/features/skills/lib/skills-events";
 import { useRecentFilesStore, type RecentFile } from "@/features/chat/stores/recent-files-store";
 import { useOrgStore } from "@/features/organisations/stores/org-store";
 import { ensureFileIndex } from "@/features/file-picker/lib/file-picker-api";
-import { activeWorkspaceId } from "@/features/workspaces/lib/active-workspace";
+import { activeProjectId } from "@/features/projects/lib/active-project";
 
 // ── Public API ───────────────────────────────────────────────────────────────
 
@@ -94,6 +99,9 @@ export interface MentionPickerProps {
   /** Active chat agent's skill-registry id. When set, pack-component
    *  mentions (command/agent/rule) only list ones enabled for this agent. */
   agentId?: string;
+  /** The chat tab this picker types into. Comments on that tab's recorded
+   *  session are offered only when it is given. */
+  tabId?: string;
   /** A mention was picked. Parent inserts the chip. */
   onSelect: (mention: MentionData) => void;
   /** Picker closed itself (Esc, no anchor, etc). */
@@ -137,6 +145,7 @@ export const MentionPicker = forwardRef<MentionPickerHandle, MentionPickerProps>
       anchor,
       projectPath,
       agentId,
+      tabId,
       onSelect,
       onClose,
       excludeIds,
@@ -146,7 +155,7 @@ export const MentionPicker = forwardRef<MentionPickerHandle, MentionPickerProps>
     ref,
   ) {
     const recentFiles = useRecentFilesStore.use.items();
-    // Workspace mentions are scoped to the active org (see `searchWorkspaces`).
+    // Project mentions are scoped to the active org (see `searchProjects`).
     // Subscribe so switching orgs re-runs the search and the list reflects the
     // new org's projects even while the picker stays mounted.
     const activeOrganisationId = useOrgStore.use.activeOrganisationId();
@@ -159,7 +168,7 @@ export const MentionPicker = forwardRef<MentionPickerHandle, MentionPickerProps>
     const [results, setResults] = useState<MentionData[]>([]);
     const [active, setActive] = useState(0);
     /** True until the backend FileIndex finishes its initial walk for the
-     *  active workspace. With multiple workspaces the first `@`/`~` in a
+     *  active project. With multiple projects the first `@`/`~` in a
      *  freshly-switched project can land before its index is built — without
      *  this we'd flash a misleading "No matches" instead of a loading hint. */
     const [indexing, setIndexing] = useState(false);
@@ -190,7 +199,7 @@ export const MentionPicker = forwardRef<MentionPickerHandle, MentionPickerProps>
     useEffect(() => {
       if (!open) return;
       const controller = new AbortController();
-      const ctx: MentionContext = { projectPath, agentId };
+      const ctx: MentionContext = { projectPath, agentId, tabId };
 
       // No debounce — the Rust side reads everything from cached
       // state now (file index, folder list, git refs, knowledge,
@@ -233,6 +242,7 @@ export const MentionPicker = forwardRef<MentionPickerHandle, MentionPickerProps>
       pastSession,
       projectPath,
       agentId,
+      tabId,
       excludeIds,
       indexNonce,
       activeOrganisationId,
@@ -246,9 +256,9 @@ export const MentionPicker = forwardRef<MentionPickerHandle, MentionPickerProps>
       setActive(0);
     }, [query, scope, pastSession]);
 
-    // Detect whether the active workspace's file index is still building, for
+    // Detect whether the active project's file index is still building, for
     // the file-dependent scopes (blended / file / folder). Drives the
-    // "Indexing files…" hint so the first `@` in a freshly-opened workspace
+    // "Indexing files…" hint so the first `@` in a freshly-opened project
     // shows a loading state instead of "No matches". `ensureFileIndex` returns
     // null on the already-confirmed fast path (→ not indexing).
     useEffect(() => {
@@ -279,11 +289,11 @@ export const MentionPicker = forwardRef<MentionPickerHandle, MentionPickerProps>
       let unlisten: (() => void) | null = null;
       void listen<{ workspaceId?: string }>("atlas:fileindex:updated", (ev) => {
         if (cancelled) return;
-        // The event carries the owning workspace — a background reindex for
-        // ANOTHER workspace must not clear this picker's loading hint or
+        // The event carries the owning project — a background reindex for
+        // ANOTHER project must not clear this picker's loading hint or
         // re-fire its search.
         const ws = ev.payload?.workspaceId;
-        if (ws && ws !== activeWorkspaceId()) return;
+        if (ws && ws !== activeProjectId()) return;
         setIndexing(false);
         setIndexNonce((n) => n + 1);
       }).then((un) => {
@@ -373,7 +383,7 @@ export const MentionPicker = forwardRef<MentionPickerHandle, MentionPickerProps>
       // even when scores interleave.
       const emptyQuery = !query.trim();
       // The recents mirror is a single global store reflecting the ACTIVE
-      // workspace; right after a workspace switch there's an async window
+      // project; right after a project switch there's an async window
       // where it still holds the previous project's files. Filter to THIS
       // picker's project so a recent from another project can never surface.
       const recents = emptyQuery
@@ -418,11 +428,14 @@ export const MentionPicker = forwardRef<MentionPickerHandle, MentionPickerProps>
       if (emptyQuery) {
         out.push({ type: "header", label: "Browse" });
         for (const cat of MENTION_CATEGORIES) {
+          // Comments belong to a chat's recorded session; a surface with no
+          // chat tab (the notes editor) has none to offer.
+          if (cat.kind === "comment" && !tabId) continue;
           out.push({ type: "category", cat });
         }
       }
       return out;
-    }, [scope, query, results, recentFiles, projectPath]);
+    }, [scope, query, results, recentFiles, projectPath, tabId]);
 
     // Compute the navigable rows (skip headers). `active` is an index into
     // *navigable* rows, not the full list; the renderer maps it back.
@@ -557,8 +570,8 @@ export const MentionPicker = forwardRef<MentionPickerHandle, MentionPickerProps>
           // grain overlay) made the compositor re-blend this layer against the
           // composer beneath it, which glitched against the blinking caret and
           // shifting message layout. Opaque black has no such coupling.
-          "bg-black border border-white/10",
-          "shadow-[inset_0_1px_0_rgba(255,255,255,0.06),0_8px_24px_rgba(0,0,0,0.6)]",
+          "bg-popover border border-border",
+          "inset-highlight shadow-md",
           "flex flex-col",
         )}
         // Keep mouse interactions from blurring CM:
@@ -569,14 +582,14 @@ export const MentionPicker = forwardRef<MentionPickerHandle, MentionPickerProps>
           ...positionStyle,
           width: PICKER_WIDTH,
           maxHeight: PICKER_MAX_HEIGHT,
-          zIndex: 9999,
+          zIndex: "var(--z-popover)",
         }}
       >
         {rows.length === 0 || (rows.length === 1 && rows[0].type === "header") ? (
-          <div className="flex-1 px-3 py-6 text-center text-[11px] text-text-tertiary leading-snug">
+          <div className="flex-1 px-3 py-6 text-center text-xs text-muted-foreground leading-snug">
             {indexing && (scope === null || scope === "file" || scope === "folder") ? (
               <span className="inline-flex items-center gap-1.5">
-                <span className="size-1.5 rounded-full bg-text-tertiary animate-pulse" />
+                <span className="size-1.5 rounded-full bg-muted-foreground animate-pulse" />
                 Indexing files…
               </span>
             ) : (
@@ -599,14 +612,14 @@ export const MentionPicker = forwardRef<MentionPickerHandle, MentionPickerProps>
             onSelect={onSelectRef}
           />
         )}
-        <div className="border-t border-white/10 px-3 h-[34px] flex items-center justify-between shrink-0">
-          <span className="flex items-center gap-1.5 text-[9px] text-text-tertiary">
+        <div className="border-t border-border px-3 h-[34px] flex items-center justify-between shrink-0">
+          <span className="flex items-center gap-1.5 text-3xs text-muted-foreground">
             <Kbd>↑↓</Kbd>
             <span>navigate</span>
             <Kbd>↵</Kbd>
             <span>select</span>
           </span>
-          <span className="flex items-center gap-1.5 text-[9px] text-text-tertiary">
+          <span className="flex items-center gap-1.5 text-3xs text-muted-foreground">
             <Kbd>esc</Kbd>
             <span>close</span>
           </span>
@@ -771,10 +784,10 @@ const PickerRow = memo(function PickerRow({
       onActivate(row);
     },
     className: cn(
-      "text-left px-3 flex items-center gap-2 text-[11.5px]",
+      "text-left px-3 flex items-center gap-2 text-sm",
       isActive
-        ? "bg-[var(--bg-selected)] text-[var(--text-primary)]"
-        : "text-[var(--text-secondary)] hover:bg-[var(--bg-hover)]",
+        ? "bg-[var(--atlas-element-selected)] text-[var(--foreground)]"
+        : "text-[var(--secondary-foreground)] hover:bg-[var(--atlas-element-hover)]",
     ),
   };
   if (row.type === "category") {
@@ -794,7 +807,7 @@ const PickerRow = memo(function PickerRow({
           <MessageSquare size={11} />
         </span>
         <span className="truncate flex-1 min-w-0">{row.session.title}</span>
-        <span className="text-[10px] text-text-tertiary shrink-0">
+        <span className="text-2xs text-muted-foreground shrink-0">
           {row.session.messageCount} msgs
         </span>
       </button>
@@ -805,13 +818,13 @@ const PickerRow = memo(function PickerRow({
     <button {...common} title={mentionTitle(m)}>
       <span className="opacity-75 w-4 flex items-center justify-center">
         {m.kind === "knowledge" && m.icon ? (
-          <span style={{ fontSize: 12, lineHeight: 1 }}>{m.icon}</span>
+          <span style={{ fontSize: "var(--text-sm)", lineHeight: 1 }}>{m.icon}</span>
         ) : (
           mentionGlyph(m)
         )}
       </span>
       <span className="truncate min-w-0">{primaryLabel(m)}</span>
-      <span className="flex-1 min-w-0 text-[10px] text-text-tertiary truncate">
+      <span className="flex-1 min-w-0 text-2xs text-muted-foreground truncate">
         {row.recentLabel ?? secondaryLabel(m)}
       </span>
     </button>
@@ -875,6 +888,17 @@ function CategoryIcon({ kind }: { kind: MentionKind }) {
       return <MessageSquare size={size} />;
     case "past_session":
       return <MessageSquare size={size} />;
+    // Organisation kinds reuse the icons their surfaces already use: the
+    // commit avatar's person, the comms panel's conversations, the Timeline
+    // tab's layers — so a recorded session never looks like a past session.
+    case "member":
+      return <User size={size} />;
+    case "conversation":
+      return <MessagesSquare size={size} />;
+    case "recorded_session":
+      return <Layers size={size} />;
+    case "comment":
+      return <MessageSquareQuote size={size} />;
   }
 }
 
@@ -912,6 +936,25 @@ function secondaryLabel(m: MentionData): string {
       return m.sessionTitle;
     case "past_session":
       return "session transcript";
+    case "member":
+      return m.email;
+    case "conversation":
+      return m.conversationKind === "channel"
+        ? "channel"
+        : m.conversationKind === "group_dm"
+          ? "group DM"
+          : "direct message";
+    case "recorded_session":
+      return "recorded session · Timeline";
+    case "comment":
+      return [
+        m.parentId ? "reply" : "comment",
+        `on ${m.anchorLabel}`,
+        timeAgo(m.createdAt, { suffix: true }),
+        m.resolved ? "resolved" : null,
+      ]
+        .filter(Boolean)
+        .join(" · ");
   }
 }
 
@@ -936,6 +979,11 @@ function emptyStateCopy(args: {
     return args.query
       ? `No user messages matching "${args.query}".`
       : "No user messages in this session.";
+  }
+  if (args.scope === "comment") {
+    return args.query
+      ? `No comments matching "${args.query}".`
+      : "No comments on this session yet — comments appear once it is in the cloud.";
   }
   if (args.scope) {
     const label = MENTION_CATEGORIES.find((c) => c.kind === args.scope)?.label ?? args.scope;
@@ -970,5 +1018,13 @@ function mentionTitle(m: MentionData): string {
       return m.content;
     case "past_session":
       return m.sessionTitle;
+    case "member":
+      return `${m.displayName} <${m.email}>`;
+    case "conversation":
+      return m.displayName;
+    case "recorded_session":
+      return `Recorded session ${m.sessionId}`;
+    case "comment":
+      return `${m.authorName}: ${m.body}`;
   }
 }

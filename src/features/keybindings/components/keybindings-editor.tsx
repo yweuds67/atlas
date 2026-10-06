@@ -21,7 +21,7 @@ import { ProfileBar } from "./profile-bar";
  */
 export function KeybindingsEditor() {
   const resolved = useKeybindingsStore.use.resolved();
-  const warnings = useKeybindingsStore.use.warnings();
+  const fileWarnings = useKeybindingsStore.use.warnings();
   const [search, setSearch] = useState<SearchState>({
     query: "",
     recordKeys: false,
@@ -32,6 +32,12 @@ export function KeybindingsEditor() {
   const [recorder, setRecorder] = useState<{ id: ActionId; mode: RecorderMode } | null>(null);
 
   const conflicts = useMemo(() => findConflicts(resolved.list), [resolved]);
+  const warnings = resolved.unknownPresetId
+    ? [
+        ...fileWarnings,
+        `This profile's preset “${resolved.unknownPresetId}” isn't in this version of Atlas; its keys come from Atlas's defaults.`,
+      ]
+    : fileWarnings;
 
   const rows: TableRow[] = useMemo(
     () =>
@@ -43,6 +49,10 @@ export function KeybindingsEditor() {
           id,
           bindings: resolved.byAction.get(id) ?? [],
           overridden: state?.overridden ?? false,
+          presetLabel:
+            !state?.overridden && resolved.preset && id in resolved.preset.bindings
+              ? resolved.preset.label
+              : null,
           invalid: state?.invalid ?? [],
         };
       }),
@@ -95,8 +105,11 @@ export function KeybindingsEditor() {
       <ProfileBar />
       <KeybindingsSearch state={search} onChange={setSearch} />
       {warnings.length > 0 && (
-        <div className="flex items-start gap-2 border-b border-border-default bg-[var(--status-warning-muted)] px-3 py-1.5 text-[10.5px] text-text-secondary">
-          <AlertTriangle size={11} className="mt-0.5 shrink-0 text-[var(--status-warning)]" />
+        <div className="flex items-start gap-2 border-b border-border bg-[var(--atlas-status-warning-background)] px-3 py-1.5 text-xs text-secondary-foreground">
+          <AlertTriangle
+            size={11}
+            className="mt-0.5 shrink-0 text-[var(--atlas-status-warning-foreground)]"
+          />
           <div className="space-y-0.5">
             {warnings.map((w) => (
               <div key={w}>{w}</div>

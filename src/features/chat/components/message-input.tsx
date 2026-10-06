@@ -1,6 +1,8 @@
-import { useState, useRef, useCallback, useEffect, useMemo } from "react";
+import { useState, useRef, useCallback, useEffect, useLayoutEffect, useMemo } from "react";
+import { createPortal } from "react-dom";
 import { useActionShortcut } from "@/features/keybindings/lib/use-action-shortcut";
 import { cn } from "@/lib/utils";
+import { Hint } from "@/ui/tooltip";
 import {
   ArrowUp,
   Square,
@@ -15,6 +17,7 @@ import {
   Search,
   Plus,
   RotateCw,
+  AtSign,
 } from "lucide-react";
 import { invoke } from "@tauri-apps/api/core";
 import { useChatStore } from "../stores/chat-store";
@@ -35,9 +38,13 @@ import {
 } from "@/features/agents/lib/agent-meta";
 import { canSignIn, promptSignIn } from "../lib/agent-signin";
 import { forkSessionToNewTab } from "../lib/fork-session";
-import { switchAgentForTab } from "@/features/chat/lib/switch-agent";
+import {
+  SESSION_HANDOFF_EVENT,
+  switchAgentForTab,
+  type SessionHandoffDetail,
+} from "@/features/chat/lib/switch-agent";
 import { AgentMark } from "@/components/agent-mark";
-import { loadCerseiEffort } from "../lib/cersei-model-pref";
+import { loadNativeEffort } from "../lib/native-model-pref";
 import { loadCachedAcpModels } from "../lib/acp-models-cache";
 import { modelLabel } from "../lib/model-label";
 // `ChatInput` pulls in CodeMirror (~870 KB) via `cm-mention-extension`.
@@ -66,10 +73,13 @@ import { PlanTasksPill } from "./plan-tasks-pill";
 import { openSettingsSection } from "@/features/settings/lib/open-settings";
 import { ComposerOptionsPill } from "./composer-options-pill";
 import { UsagePill } from "./usage-pill";
+import { composerPillLabelClass } from "./composer-dropup";
+import { ImageAttachmentStrip } from "./image-attachments";
 import { FeaturedAgentOffers } from "./featured-agent-offers";
 import { RetryPill } from "./retry-pill";
 import { AiGrantBar } from "./ai-grant-bar";
 import { RemovedAgentBar } from "./removed-agent-bar";
+import { ModeRestoreBar, OPEN_MODE_PICKER_EVENT } from "./mode-restore-bar";
 import { useAiGrantProbe, useNoAiGrant } from "../stores/ai-grant-store";
 import {
   QUALITY_LADDER,
@@ -77,6 +87,7 @@ import {
   exceedsBudget,
   targetDimensions,
 } from "../lib/image-policy";
+import { useSettingsStore } from "@/features/settings/stores/settings-store";
 import { ComposerAddMenu } from "./composer-add-menu";
 import type { GithubRepo } from "@/features/github/types";
 import { metaFromSearch } from "@/features/github/types";
@@ -84,14 +95,15 @@ import { imageMimeFromPath } from "@/lib/byok/model-capabilities";
 import type { ImageAttachment } from "@/types/agents";
 import type {
   MentionFile,
-  MentionWorkspace,
+  MentionProject,
   MentionRepo,
   MentionPastSession,
   PastSessionRef,
 } from "../lib/mentions";
 import { toast } from "sonner";
 import { useComposerFileDrop } from "../hooks/use-composer-file-drop";
-import { useProjectStore } from "@/features/project/stores/project-store";
+import { scratchPathForFile } from "@/lib/scratch-file";
+import { useAppStore } from "@/features/app/stores/app-store";
 import type { MentionTrigger } from "../lib/cm-mention-extension";
 import type { SlashTrigger } from "../lib/cm-slash-extension";
 // Value import — MUST come from the CodeMirror-free module, not from
@@ -100,6 +112,7 @@ import type { SlashTrigger } from "../lib/cm-slash-extension";
 // vendor chunk lands in the eager boot graph.
 import { clearSlashRange } from "../lib/cm-clear-range";
 import type { MentionData } from "../lib/mentions";
+import { COMMENT_LINK_EVENT, type CommentLinkDetail } from "../lib/comment-mentions";
 
 // Start the CodeMirror chunk download at module-evaluation time. Vite still
 // excludes it from `<link rel="modulepreload">` because the static analysis
@@ -165,6 +178,7 @@ async function downscaleAttachment(image: ImageAttachment): Promise<ImageAttachm
     // transparent pixels composite to BLACK — a macOS window capture (rounded
     // corners, drop shadow, routinely over budget) came out with black
     // corners and a black halo (#71). Paint the ground white first.
+    // ratchet-allow: the JPEG ground for a window capture (#71), not app chrome.
     ctx.fillStyle = "#fff";
     ctx.fillRect(0, 0, width, height);
     ctx.drawImage(bitmap, 0, 0, width, height);
@@ -213,10 +227,12 @@ interface MessageInputProps {
  */
 function acpModeColor(modeId: string | undefined): string {
   const id = (modeId ?? "").toLowerCase();
-  if (/full|bypass|\ball\b|danger|yolo|unrestricted/.test(id)) return "var(--status-error)";
-  if (/read.?only|\bplan\b|ask|suggest/.test(id)) return "var(--accent-primary)";
-  if (/auto|default|edit|accept|agent|workspace/.test(id)) return "var(--status-success)";
-  return "var(--text-tertiary)";
+  if (/full|bypass|\ball\b|danger|yolo|unrestricted/.test(id))
+    return "var(--atlas-status-error-foreground)";
+  if (/read.?only|\bplan\b|ask|suggest/.test(id)) return "var(--primary)";
+  if (/auto|default|edit|accept|agent|project/.test(id))
+    return "var(--atlas-status-success-foreground)";
+  return "var(--muted-foreground)";
 }
 
 interface CodebaseIndexStatus {
@@ -228,10 +244,10 @@ interface CodebaseIndexStatus {
 }
 
 /** Codebase-index status pill for the native agent — the index that grounds
- *  `search_memory`. Shows file count (or "Index memory" when unbuilt), flips to
+ *  `memory_search`. Shows file count (or "Index memory" when unbuilt), flips to
  *  "Indexing…" while the auto-indexer runs, and re-indexes on click. */
-function CerseiMemoryPill() {
-  const projectPath = useProjectStore((s) => s.currentProject?.path ?? null);
+function NativeMemoryPill() {
+  const projectPath = useAppStore((s) => s.currentProject?.path ?? null);
   const [status, setStatus] = useState<CodebaseIndexStatus | null>(null);
   const [indexing, setIndexing] = useState(false);
 
@@ -254,8 +270,8 @@ function CerseiMemoryPill() {
       setIndexing(d.active);
       if (!d.active) refresh();
     };
-    window.addEventListener("atlas:cersei-index", onIdx);
-    return () => window.removeEventListener("atlas:cersei-index", onIdx);
+    window.addEventListener("atlas:agent-index", onIdx);
+    return () => window.removeEventListener("atlas:agent-index", onIdx);
   }, [projectPath, refresh]);
 
   const reindex = () => {
@@ -283,19 +299,17 @@ function CerseiMemoryPill() {
       onClick={reindex}
       disabled={indexing}
       title="Codebase index that grounds the agent's memory recall — click to re-index"
-      className="flex items-center gap-1.5 px-2 h-6.5 rounded-full border border-[var(--border-default)] bg-[var(--bg-elevated)] text-[10px] leading-none font-medium text-[var(--text-tertiary)] hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)] transition-colors cursor-pointer tabular-nums disabled:cursor-default"
+      className="flex items-center px-2 h-6.5 rounded-full border border-[var(--border)] bg-[var(--card)] text-2xs leading-none font-medium text-[var(--muted-foreground)] hover:bg-[var(--atlas-element-hover)] hover:text-[var(--foreground)] transition-colors cursor-pointer tabular-nums disabled:cursor-default"
     >
       {indexing ? (
-        <Loader2 size={11} className="animate-spin text-[var(--accent-primary)]" />
+        <Loader2 size={11} className="animate-spin text-[var(--primary)]" />
       ) : (
         <Database
           size={11}
-          className={
-            status?.indexed ? "text-[var(--accent-primary)]" : "text-[var(--text-tertiary)]"
-          }
+          className={status?.indexed ? "text-[var(--primary)]" : "text-[var(--muted-foreground)]"}
         />
       )}
-      {label}
+      <span className={composerPillLabelClass("early")}>{label}</span>
     </button>
   );
 }
@@ -306,26 +320,28 @@ const EFFORT_CYCLE = ["", "low", "medium", "high", "max"] as const;
  *  thinking budget). Cycles off → low → medium → high → max. Hidden for
  *  providers that don't support a thinking budget. */
 function EffortPill({ tabId }: { tabId: string }) {
-  const provider = useChatStore((s) => s.sessions[tabId]?.cerseiProvider ?? "");
-  const effort = useChatStore((s) => s.sessions[tabId]?.cerseiEffort ?? "");
-  const { setCerseiEffort } = useChatStore.use.actions();
+  const provider = useChatStore((s) => s.sessions[tabId]?.nativeProvider ?? "");
+  const effort = useChatStore((s) => s.sessions[tabId]?.nativeEffort ?? "");
+  const { setNativeEffort } = useChatStore.use.actions();
   if (provider !== "anthropic") return null;
   const cycle = () => {
     const i = EFFORT_CYCLE.indexOf(effort as (typeof EFFORT_CYCLE)[number]);
-    setCerseiEffort(tabId, EFFORT_CYCLE[(i + 1) % EFFORT_CYCLE.length]);
+    setNativeEffort(tabId, EFFORT_CYCLE[(i + 1) % EFFORT_CYCLE.length]);
   };
   const active = effort !== "";
   return (
     <button
       onClick={cycle}
-      className="flex items-center gap-1.5 px-2 h-6.5 rounded-full border border-[var(--border-default)] bg-[var(--bg-elevated)] text-[10px] leading-none font-medium text-[var(--text-secondary)] hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)] transition-colors cursor-pointer"
+      className="flex items-center px-2 h-6.5 rounded-full border border-[var(--border)] bg-[var(--card)] text-2xs leading-none font-medium text-[var(--secondary-foreground)] hover:bg-[var(--atlas-element-hover)] hover:text-[var(--foreground)] transition-colors cursor-pointer"
       title="Reasoning effort (thinking budget) — Anthropic models"
     >
       <Brain
         size={11}
-        className={active ? "text-[var(--accent-primary)]" : "text-[var(--text-tertiary)]"}
+        className={active ? "text-[var(--primary)]" : "text-[var(--muted-foreground)]"}
       />
-      {active ? `Think: ${effort}` : "Think"}
+      <span className={composerPillLabelClass("early")}>
+        {active ? `Think: ${effort}` : "Think"}
+      </span>
     </button>
   );
 }
@@ -351,15 +367,15 @@ const GROUP_ORDER: ComposerGroup[] = ["agent", "mode", "model"];
 function claudeModeDotClass(mode: ClaudePermissionMode): string {
   switch (mode) {
     case "acceptEdits":
-      return "bg-[var(--status-success)]";
+      return "bg-[var(--atlas-status-success-foreground)]";
     case "plan":
-      return "bg-[var(--accent-primary)]";
+      return "bg-[var(--primary)]";
     case "bypassPermissions":
-      return "bg-[var(--status-error)]";
+      return "bg-[var(--atlas-status-error-foreground)]";
     case "auto":
-      return "bg-[var(--status-warning)]";
+      return "bg-[var(--atlas-status-warning-foreground)]";
     default:
-      return "bg-[var(--text-tertiary)]";
+      return "bg-[var(--muted-foreground)]";
   }
 }
 
@@ -437,7 +453,20 @@ function ComposerGroupsMenu({
     };
   }, [openGroup]);
 
-  const isNative = agentType === "cersei";
+  // "Choose mode" on the mode-restore bar opens the mode group from outside.
+  useEffect(() => {
+    const onOpen = (e: Event) => {
+      if ((e as CustomEvent<{ tabId?: string }>).detail?.tabId !== tabId) return;
+      setQ("");
+      setOpenGroup("mode");
+      // Mutual exclusion with the + menu — see atlas:composer-menu-open.
+      window.dispatchEvent(new CustomEvent("atlas:composer-menu-open", { detail: "groups" }));
+    };
+    window.addEventListener(OPEN_MODE_PICKER_EVENT, onOpen);
+    return () => window.removeEventListener(OPEN_MODE_PICKER_EVENT, onOpen);
+  }, [tabId]);
+
+  const isNative = agentType === "atlas-agent";
   const refreshingModels = useNativeModelsStore.use.refreshing();
   const refreshNativeModels = useNativeModelsStore.use.actions().refresh;
 
@@ -499,13 +528,12 @@ function ComposerGroupsMenu({
   // Labels stay visible on every pill — the reference folds unselected tabs
   // to icon-only, but on a toolbar whose pills are real controls that reads
   // worse than it looks (deliberately skipped).
-  const labelCls = (_active: boolean) => "ml-1.5 whitespace-nowrap";
   const pillCls = (active: boolean) =>
     cn(
-      "flex items-center px-1.5 h-6.5 rounded-full border text-[10px] leading-none font-medium transition-colors cursor-pointer",
+      "flex items-center px-1.5 h-6.5 rounded-full border text-2xs leading-none font-medium transition-colors cursor-pointer",
       active
-        ? "border-[var(--border-strong)] bg-[var(--bg-selected)] text-[var(--text-primary)]"
-        : "border-[var(--border-default)] bg-[var(--bg-elevated)] text-[var(--text-secondary)] hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)]",
+        ? "border-[var(--atlas-border-strong)] bg-[var(--atlas-element-selected)] text-[var(--foreground)]"
+        : "border-[var(--border)] bg-[var(--card)] text-[var(--secondary-foreground)] hover:bg-[var(--atlas-element-hover)] hover:text-[var(--foreground)]",
     );
 
   return (
@@ -516,7 +544,7 @@ function ComposerGroupsMenu({
           the same surface — the reference's shared-layout feel. */}
       <div
         aria-hidden={!openGroup}
-        className="absolute bottom-full left-0 z-50 mb-1.5 w-[300px] overflow-hidden rounded-xl border border-[var(--border-default)] bg-[var(--bg-elevated)] shadow-[var(--shadow-overlay)]"
+        className="absolute bottom-full left-0 z-popover mb-1.5 w-[300px] overflow-hidden rounded-xl border border-[var(--border)] bg-[var(--card)] shadow-md"
         style={{
           height: openGroup ? panelHeight : 0,
           opacity: openGroup ? 1 : 0,
@@ -544,14 +572,14 @@ function ComposerGroupsMenu({
                         }}
                         className={cn(
                           "flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left transition-colors cursor-pointer",
-                          active ? "bg-[var(--bg-selected)]" : "hover:bg-[var(--bg-hover)]",
+                          active
+                            ? "bg-[var(--atlas-element-selected)]"
+                            : "hover:bg-[var(--atlas-element-hover)]",
                         )}
                       >
-                        <AgentMark agentType={a} className="!h-4 !w-4 !text-[9px] !rounded" />
-                        <span className="flex-1 truncate text-[11px] font-medium text-[var(--text-primary)]">
-                          {agentMeta(a).label}
-                        </span>
-                        {active && <Check size={11} className="text-[var(--accent-primary)]" />}
+                        <AgentMark agentType={a} className="!h-4 !w-4 !text-3xs !rounded" />
+                        <span className="flex-1 truncate label">{agentMeta(a).label}</span>
+                        {active && <Check size={11} className="text-[var(--primary)]" />}
                       </button>
                     );
                   })}
@@ -565,13 +593,13 @@ function ComposerGroupsMenu({
                     close();
                   }}
                 />
-                <div className="h-px bg-[var(--border-default)]" />
+                <div className="h-px bg-[var(--border)]" />
                 <button
                   onClick={() => {
                     close();
                     openSettingsSection("agents");
                   }}
-                  className="flex w-full items-center gap-1.5 px-3 py-2 text-[11px] text-[var(--text-secondary)] transition-colors cursor-pointer hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)]"
+                  className="flex w-full items-center gap-1.5 px-3 py-2 text-xs text-[var(--secondary-foreground)] transition-colors cursor-pointer hover:bg-[var(--atlas-element-hover)] hover:text-[var(--foreground)]"
                 >
                   <Plus size={11} className="shrink-0" />
                   Add more agents
@@ -592,16 +620,16 @@ function ComposerGroupsMenu({
                       }}
                       className={cn(
                         "flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left transition-colors cursor-pointer",
-                        active ? "bg-[var(--bg-selected)]" : "hover:bg-[var(--bg-hover)]",
+                        active
+                          ? "bg-[var(--atlas-element-selected)]"
+                          : "hover:bg-[var(--atlas-element-hover)]",
                       )}
                     >
                       <span
                         className={cn("h-1.5 w-1.5 shrink-0 rounded-full", claudeModeDotClass(m))}
                       />
-                      <span className="flex-1 text-[11px] font-medium text-[var(--text-primary)]">
-                        {CLAUDE_PERMISSION_MODE_LABEL[m]}
-                      </span>
-                      {active && <Check size={11} className="text-[var(--accent-primary)]" />}
+                      <span className="flex-1 label">{CLAUDE_PERMISSION_MODE_LABEL[m]}</span>
+                      {active && <Check size={11} className="text-[var(--primary)]" />}
                     </button>
                   );
                 })}
@@ -611,7 +639,7 @@ function ComposerGroupsMenu({
             {openGroup === "mode" && !isClaude && (
               <div className="p-1">
                 {!hasAcpModes ? (
-                  <div className="flex items-center gap-1.5 px-2 py-2 text-[11px] text-[var(--text-tertiary)]">
+                  <div className="flex items-center gap-1.5 px-2 py-2 text-xs text-[var(--muted-foreground)]">
                     <Loader2 size={11} className="animate-spin" /> Loading modes…
                   </div>
                 ) : (
@@ -626,7 +654,9 @@ function ComposerGroupsMenu({
                         }}
                         className={cn(
                           "flex w-full items-start gap-1.5 rounded-md px-2 py-1.5 text-left transition-colors cursor-pointer",
-                          active ? "bg-[var(--bg-selected)]" : "hover:bg-[var(--bg-hover)]",
+                          active
+                            ? "bg-[var(--atlas-element-selected)]"
+                            : "hover:bg-[var(--atlas-element-hover)]",
                         )}
                       >
                         <span
@@ -634,12 +664,12 @@ function ComposerGroupsMenu({
                           style={{ background: acpModeColor(m.id) }}
                         />
                         <span className="min-w-0 flex-1">
-                          <span className="flex items-center gap-1.5 text-[11px] font-medium text-[var(--text-primary)]">
+                          <span className="flex items-center gap-1.5 label">
                             {displayModeName(m.name)}
-                            {active && <Check size={11} className="text-[var(--accent-primary)]" />}
+                            {active && <Check size={11} className="text-[var(--primary)]" />}
                           </span>
                           {m.description && (
-                            <span className="mt-0.5 block text-[9px] leading-snug text-[var(--text-tertiary)]">
+                            <span className="mt-0.5 block text-3xs leading-snug text-[var(--muted-foreground)]">
                               {m.description}
                             </span>
                           )}
@@ -653,43 +683,43 @@ function ComposerGroupsMenu({
 
             {openGroup === "model" && (
               <>
-                <div className="flex h-8 items-center gap-1.5 border-b border-[var(--border-subtle)] px-2.5">
-                  <Search size={12} className="shrink-0 text-[var(--text-tertiary)]" />
+                <div className="flex h-8 items-center gap-1.5 border-b border-[var(--atlas-border-subtle)] px-2.5">
+                  <Search size={12} className="shrink-0 text-[var(--muted-foreground)]" />
                   <input
                     autoFocus
                     value={q}
                     onChange={(e) => setQ(e.target.value)}
                     placeholder="Search models…"
                     spellCheck={false}
-                    className="min-w-0 flex-1 bg-transparent text-[11px] text-[var(--text-primary)] outline-none placeholder:text-[var(--text-tertiary)]"
+                    className="min-w-0 flex-1 bg-transparent text-xs text-[var(--foreground)] outline-none placeholder:text-[var(--muted-foreground)]"
                   />
                   {isNative && (
                     // The gateway's list, re-fetched on demand (ADR-0007).
                     // Same icon, spin and disabled idiom as the grant bar's
                     // Refresh — no new pattern.
-                    <button
-                      type="button"
-                      title="Refresh models"
-                      aria-label="Refresh models"
-                      disabled={refreshingModels}
-                      onClick={() => void refreshNativeModels()}
-                      className={cn(
-                        "shrink-0 rounded p-0.5 text-[var(--text-tertiary)] transition-colors",
-                        refreshingModels
-                          ? "cursor-default"
-                          : "cursor-pointer hover:text-[var(--text-primary)]",
-                      )}
-                    >
-                      <RotateCw size={12} className={cn(refreshingModels && "animate-spin")} />
-                    </button>
+                    <Hint label="Refresh models" side="top">
+                      <button
+                        type="button"
+                        disabled={refreshingModels}
+                        onClick={() => void refreshNativeModels()}
+                        className={cn(
+                          "shrink-0 rounded p-0.5 text-[var(--muted-foreground)] transition-colors",
+                          refreshingModels
+                            ? "cursor-default"
+                            : "cursor-pointer hover:text-[var(--foreground)]",
+                        )}
+                      >
+                        <RotateCw size={12} className={cn(refreshingModels && "animate-spin")} />
+                      </button>
+                    </Hint>
                   )}
                 </div>
                 <div className="max-h-[280px] overflow-y-auto hide-scrollbar p-1">
                   {filteredModels.length === 0 ? (
-                    <div className="px-2.5 py-2 text-[11px] text-[var(--text-tertiary)]">
+                    <div className="px-2.5 py-2 text-xs text-[var(--muted-foreground)]">
                       No models
                       {isNative && models.length === 0 && (
-                        <span className="mt-0.5 block text-[9px] leading-snug">
+                        <span className="mt-0.5 block text-3xs leading-snug">
                           Couldn't load the model list. Check your connection or sign in, then
                           refresh.
                         </span>
@@ -707,22 +737,21 @@ function ComposerGroupsMenu({
                           }}
                           className={cn(
                             "flex w-full items-start gap-1.5 rounded-md px-2 py-1.5 text-left transition-colors cursor-pointer",
-                            active ? "bg-[var(--bg-selected)]" : "hover:bg-[var(--bg-hover)]",
+                            active
+                              ? "bg-[var(--atlas-element-selected)]"
+                              : "hover:bg-[var(--atlas-element-hover)]",
                           )}
                         >
                           <span className="min-w-0 flex-1">
-                            <span className="flex items-center gap-1.5 text-[11px] font-medium text-[var(--text-primary)]">
+                            <span className="flex items-center gap-1.5 label">
                               <span className="truncate">{modelLabel(m)}</span>
                               {active && (
-                                <Check
-                                  size={11}
-                                  className="shrink-0 text-[var(--accent-primary)]"
-                                />
+                                <Check size={11} className="shrink-0 text-[var(--primary)]" />
                               )}
                             </span>
                             {m.description &&
                               m.description.trim().toLowerCase() !== "recommended" && (
-                                <span className="mt-0.5 block text-[9px] leading-snug text-[var(--text-tertiary)] line-clamp-2">
+                                <span className="mt-0.5 block text-3xs leading-snug text-[var(--muted-foreground)] line-clamp-2">
                                   {m.description}
                                 </span>
                               )}
@@ -746,8 +775,8 @@ function ComposerGroupsMenu({
           cycleAgentHint ? `Coding agent — pick here, ${cycleAgentHint} cycles` : "Coding agent"
         }
       >
-        <AgentMark agentType={agentType} className="!h-4 !w-4 !text-[9px] !rounded" />
-        <span className={labelCls(openGroup === "agent")}>{agentMeta(currentAgent).label}</span>
+        <AgentMark agentType={agentType} className="!h-4 !w-4 !text-3xs !rounded" />
+        <span className={composerPillLabelClass("late")}>{agentMeta(currentAgent).label}</span>
       </button>
 
       {showMode && (
@@ -769,7 +798,7 @@ function ComposerGroupsMenu({
               style={{ background: acpModeColor(currentMode) }}
             />
           )}
-          <span className={labelCls(openGroup === "mode")}>
+          <span className={composerPillLabelClass("late")}>
             {isClaude
               ? CLAUDE_PERMISSION_MODE_LABEL[permissionMode]
               : currentAcpMode
@@ -787,11 +816,13 @@ function ComposerGroupsMenu({
           className={pillCls(openGroup === "model")}
           title="Model"
         >
-          <Cpu size={11} className="shrink-0 text-[var(--text-tertiary)]" />
-          <span className={cn(labelCls(openGroup === "model"), "max-w-[120px] truncate")}>
+          <Cpu size={11} className="shrink-0 text-[var(--muted-foreground)]" />
+          <span
+            className={cn(composerPillLabelClass(), "max-w-[80px] truncate @[460px]:max-w-[120px]")}
+          >
             {currentModelInfo ? modelLabel(currentModelInfo) : (currentModel ?? "Model")}
           </span>
-          <ChevronDown size={10} className="ml-0.5 shrink-0 text-[var(--text-tertiary)]" />
+          <ChevronDown size={10} className="ml-0.5 shrink-0 text-[var(--muted-foreground)]" />
         </button>
       )}
     </div>
@@ -807,7 +838,7 @@ export function MessageInput({
   disabled: disabledProp = false,
   placeholder = "Message Atlas... (@ to mention, / for commands)",
 }: MessageInputProps) {
-  const { enqueueMessage, removeQueueItem, setAcpModes, setAcpModesPending, setCerseiEffort } =
+  const { enqueueMessage, removeQueueItem, setAcpModes, setAcpModesPending, setNativeEffort } =
     useChatStore.use.actions();
   // Show the picker as soon as the agent is non-Claude — even before its modes
   // load — so the composer can render a loading pill instead of nothing during
@@ -872,7 +903,7 @@ export function MessageInput({
   const agentType = useChatStore((s) => s.sessions[tabId]?.agentType ?? "claude-code");
   // Settings → General → "Enter to send". Narrow selector so a toggle flip
   // only re-renders composers, not the whole settings surface.
-  const enterToSend = useProjectStore((s) => s.settings.enterToSend);
+  const enterToSend = useSettingsStore((s) => s.settings.enterToSend);
   // `agentType` normalised for the composer sub-components (session scope,
   // agent switcher) + the label lookup. This used to be a hardcoded list of the
   // six first-party agents with everything else falling through to
@@ -902,29 +933,32 @@ export function MessageInput({
   // button — the toolbar, and with it the switcher, stays live, so the user can
   // always move to an agent that runs. Verified against the escape hatch: this
   // must never disable the toolbar.
-  const blockedByGrant = noAiGrant && agentType === "cersei";
+  const blockedByGrant = noAiGrant && agentType === "atlas-agent";
   const disabled = disabledProp || blockedByGrant;
+  // A resume could not restore the user's mode (`ModeRestoreBar`): no send
+  // until they pick one. Only the send — typing and the mode picker stay live.
+  const modeUnrestored = useChatStore((s) => !!s.sessions[tabId]?.unrestoredModeId);
   // The BYOK provider/model bindings for the native agent stood here — the
   // provider pick, the model re-push on bind, the whole BYOK selection path.
   // Gone: the native agent's model comes from the seam's published catalogue
   // through the same `setAcpModel` path every other agent uses, and its
   // "provider" is the Atlas gateway, which is not a choice.
-  // Seed the reasoning-effort from the saved preference once per cersei session,
+  // Seed the reasoning-effort from the saved preference once per native session,
   // then re-push it whenever the session is bound (mirrors the model re-push).
-  const cerseiEffort = useChatStore((s) => s.sessions[tabId]?.cerseiEffort);
-  const cerseiBound = useChatStore((s) => {
+  const nativeEffort = useChatStore((s) => s.sessions[tabId]?.nativeEffort);
+  const nativeBound = useChatStore((s) => {
     const sess = s.sessions[tabId];
-    return sess?.agentType === "cersei" && !!sess.acpAgentId && !!sess.acpSessionId
+    return sess?.agentType === "atlas-agent" && !!sess.acpAgentId && !!sess.acpSessionId
       ? `${sess.acpAgentId}::${sess.acpSessionId}`
       : null;
   });
   useEffect(() => {
-    if (agentType !== "cersei") return;
+    if (agentType !== "atlas-agent") return;
     // Undefined = never set for this session → seed from the global pref.
-    const eff = cerseiEffort ?? loadCerseiEffort();
-    if (cerseiBound || cerseiEffort === undefined) setCerseiEffort(tabId, eff);
+    const eff = nativeEffort ?? loadNativeEffort();
+    if (nativeBound || nativeEffort === undefined) setNativeEffort(tabId, eff);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [tabId, agentType, cerseiBound]);
+  }, [tabId, agentType, nativeBound]);
   // The RTK compression toggle was seeded and re-pushed here. It is gone with
   // the runtime that implemented it (#54) — the ported engine has no
   // tool-output compressor, so the control had nothing to switch (D8).
@@ -1098,7 +1132,7 @@ export function MessageInput({
   }, [tabId, disabled]);
 
   // ── Mention picker orchestration ──────────────────────────────────────
-  const projectPath = useProjectStore((s) => s.currentProject?.path ?? null);
+  const projectPath = useAppStore((s) => s.currentProject?.path ?? null);
   const [trigger, setTrigger] = useState<MentionTrigger | null>(null);
   const pickerRef = useRef<MentionPickerHandle>(null);
   const triggerRef = useRef<MentionTrigger | null>(null);
@@ -1147,9 +1181,11 @@ export function MessageInput({
     // the caret; the plugin will fire the null transition for us.
   }, []);
 
-  // ── Drag-and-drop OS files onto the composer → attach as mention chips ──
+  // ── File chips ──────────────────────────────────────────────────────────
+  // A path the agent reads off disk. `attachPaths` (below) decides between
+  // this and an inline image; only that and the screenshot fallback call it.
   const composerRef = useRef<HTMLDivElement>(null);
-  const handleDropFiles = useCallback(
+  const insertFileChips = useCallback(
     (paths: string[]) => {
       const root = projectPath && !projectPath.endsWith("/") ? `${projectPath}/` : projectPath;
       for (const abs of paths) {
@@ -1169,18 +1205,16 @@ export function MessageInput({
     },
     [projectPath],
   );
-  const { isDropTarget } = useComposerFileDrop({
-    targetRef: composerRef,
-    enabled: !disabled,
-    onDropFiles: handleDropFiles,
-  });
-
   // ── Image attachments (multimodal input) ─────────────────────────────────
   // Images staged for the next send, shown as thumbnails above the input.
   // Only populated when the bound agent advertised promptCapabilities.image;
   // otherwise picked images degrade to path mention chips (any agent can
   // read those off disk).
   const [stagedImages, setStagedImages] = useState<ImageAttachment[]>([]);
+  const removeStagedImage = useCallback(
+    (index: number) => setStagedImages((prev) => prev.filter((_, j) => j !== index)),
+    [],
+  );
   // Non-null (the repo's full_name) while a GitHub repo is cloning into
   // `.atlas/repos`. The composer is locked for the duration so the user can't
   // send a prompt that references a half-synced repo.
@@ -1236,22 +1270,17 @@ export function MessageInput({
     if (!stagedOverAggregateBudget) warnedAggregateRef.current = false;
   }, [stagedOverAggregateBudget]);
 
-  // "+" menu → "Add files or photos". The Tauri dialog hands back real
-  // paths (a browser file input wouldn't), which is what makes the routing
-  // possible: images become inline base64 attachments when the agent
-  // supports them; everything else — and any unreadable image — becomes a
-  // path mention chip via the same handler the drag-drop path uses.
-  const pickFilesOrPhotos = useCallback(async () => {
-    try {
-      const { open } = await import("@tauri-apps/plugin-dialog");
-      const picked = await open({
-        multiple: true,
-        title: "Attach files or photos",
-      });
-      if (!picked) return;
-      const paths = (Array.isArray(picked) ? picked : [picked]) as string[];
+  // ── Attaching files by path ──────────────────────────────────────────────
+  // The one routing rule for every way a file with a path arrives — dropped
+  // from Finder, picked in the "+" menu, copied in Finder and pasted: images
+  // become inline base64 attachments when the agent supports them; everything
+  // else — and any image that won't read — becomes a path chip. A drop used to
+  // skip the image branch, so a dropped screenshot reached the agent as a path
+  // it might never open, while the same image pasted arrived inline.
+  const attachPaths = useCallback(
+    async (paths: string[]) => {
       const images: ImageAttachment[] = [];
-      const mentionPaths: string[] = [];
+      const chipPaths: string[] = [];
       for (const p of paths) {
         const mime = imageSupported ? imageMimeFromPath(p) : null;
         if (mime) {
@@ -1260,28 +1289,75 @@ export function MessageInput({
             images.push(await downscaleAttachment({ mimeType: mime, dataBase64: data }));
             continue;
           } catch {
-            // Unreadable as base64 → fall through to a path mention.
+            // Unreadable as base64 → fall through to a path chip.
           }
         }
-        mentionPaths.push(p);
+        chipPaths.push(p);
       }
       if (images.length) setStagedImages((prev) => [...prev, ...images]);
-      if (mentionPaths.length) handleDropFiles(mentionPaths);
+      if (chipPaths.length) insertFileChips(chipPaths);
       requestAnimationFrame(() => inputRef.current?.focus());
+    },
+    [imageSupported, insertFileChips],
+  );
+
+  // Drag-and-drop from the OS. The zone is the whole conversation column
+  // (`data-chat-drop-zone` in chat-panel.tsx), not this composer: a thin
+  // target under a drag image that hangs off the cursor lit up and went dark
+  // seemingly at random. Each split pane has its own column, so a drop still
+  // lands in the pane under the cursor. Outside a chat panel, the composer.
+  //
+  // A drop ALWAYS becomes an inline `@file` chip at the caret — it does not go
+  // through `attachPaths`, and an image is no exception. Dragging a file into
+  // the conversation is a pointing gesture: "this one, here, in the sentence I
+  // am writing". Routing a dropped image to the thumbnail strip above the
+  // field answered a question the user had not asked — it detached the file
+  // from the place they aimed it, and left the prompt with no reference to it
+  // at all, so the sentence read "look at this" with no "this" in it. The
+  // explicit attach gestures ("+" ▸ Add files / Attach media, and paste) still
+  // route through `attachPaths`, where a thumbnail IS the thing being asked
+  // for. The chip carries the absolute path, which rides to the agent as an
+  // ACP `ResourceLink` (`compose_prompt`) — every agent reads those, and a
+  // vision agent opens the image itself.
+  const dropZoneRef = useRef<HTMLElement | null>(null);
+  const [dropZoneEl, setDropZoneEl] = useState<HTMLElement | null>(null);
+  useLayoutEffect(() => {
+    const composer = composerRef.current;
+    const zone = composer?.closest<HTMLElement>("[data-chat-drop-zone]") ?? composer ?? null;
+    dropZoneRef.current = zone;
+    setDropZoneEl(zone);
+  }, []);
+  const onDropFiles = useCallback((paths: string[]) => insertFileChips(paths), [insertFileChips]);
+  const { isDropTarget } = useComposerFileDrop({
+    targetRef: dropZoneRef,
+    enabled: !disabled,
+    onDropFiles,
+  });
+
+  // "+" menu → "Add files or photos". The Tauri dialog hands back real
+  // paths (a browser file input wouldn't), which is what makes the
+  // `attachPaths` routing possible.
+  const pickFilesOrPhotos = useCallback(async () => {
+    try {
+      const { open } = await import("@tauri-apps/plugin-dialog");
+      const picked = await open({
+        multiple: true,
+        title: "Attach files or photos",
+      });
+      if (!picked) return;
+      await attachPaths((Array.isArray(picked) ? picked : [picked]) as string[]);
     } catch (err) {
       console.warn("attach picker failed:", err);
     }
-  }, [imageSupported, handleDropFiles]);
+  }, [attachPaths]);
 
-  const handlePickWorkspace = useCallback((workspace: MentionWorkspace) => {
-    inputRef.current?.insertMention(workspace);
+  const handlePickProject = useCallback((project: MentionProject) => {
+    inputRef.current?.insertMention(project);
     requestAnimationFrame(() => inputRef.current?.focus());
   }, []);
 
-  // "+" menu → "Attach media". Same routing as the files picker, but the OS
-  // dialog is filtered to image/video extensions. Images ride along as inline
-  // base64 (when the agent supports it); video and anything unreadable become
-  // path mention chips the agent reads off disk.
+  // "+" menu → "Attach media". The files picker, with the OS dialog filtered
+  // to image/video extensions; video becomes a path chip via `attachPaths`.
   const pickMedia = useCallback(async () => {
     try {
       const { open } = await import("@tauri-apps/plugin-dialog");
@@ -1311,29 +1387,11 @@ export function MessageInput({
         ],
       });
       if (!picked) return;
-      const paths = (Array.isArray(picked) ? picked : [picked]) as string[];
-      const images: ImageAttachment[] = [];
-      const mentionPaths: string[] = [];
-      for (const p of paths) {
-        const mime = imageSupported ? imageMimeFromPath(p) : null;
-        if (mime) {
-          try {
-            const data = await invoke<string>("read_file_base64", { path: p });
-            images.push(await downscaleAttachment({ mimeType: mime, dataBase64: data }));
-            continue;
-          } catch {
-            // Unreadable as base64 → fall through to a path mention.
-          }
-        }
-        mentionPaths.push(p);
-      }
-      if (images.length) setStagedImages((prev) => [...prev, ...images]);
-      if (mentionPaths.length) handleDropFiles(mentionPaths);
-      requestAnimationFrame(() => inputRef.current?.focus());
+      await attachPaths((Array.isArray(picked) ? picked : [picked]) as string[]);
     } catch (err) {
       console.warn("media picker failed:", err);
     }
-  }, [imageSupported, handleDropFiles]);
+  }, [attachPaths]);
 
   // "+" menu → "Take a screenshot". Shells out to the native macOS
   // `screencapture` CLI (region selection or whole desktop), then attaches the
@@ -1345,7 +1403,7 @@ export function MessageInput({
         // Let the "+" menu fully close first so it (and any dropdown) isn't caught
         // in a whole-desktop capture.
         await new Promise((r) => setTimeout(r, 250));
-        const proj = useProjectStore.getState().currentProject?.path ?? null;
+        const proj = useAppStore.getState().currentProject?.path ?? null;
         const res = await invoke<{
           path: string;
           mimeType: string;
@@ -1361,14 +1419,14 @@ export function MessageInput({
           });
           setStagedImages((prev) => [...prev, shrunk]);
         } else {
-          handleDropFiles([res.path]);
+          insertFileChips([res.path]);
         }
         requestAnimationFrame(() => inputRef.current?.focus());
       } catch (err) {
         toast.error(`Screenshot failed: ${err instanceof Error ? err.message : String(err)}`);
       }
     },
-    [imageSupported, handleDropFiles],
+    [imageSupported, insertFileChips],
   );
 
   // "+" menu → "Add from GitHub". Shorthand for the GitHub panel's search+clone:
@@ -1377,7 +1435,7 @@ export function MessageInput({
   // explores it (compose_prompt turns that chip into an "explore this repo"
   // block pointing at the absolute path).
   const handleCloneRepo = useCallback(async (repo: GithubRepo) => {
-    const proj = useProjectStore.getState().currentProject?.path;
+    const proj = useAppStore.getState().currentProject?.path;
     if (!proj) {
       toast.error("Open a project before cloning a repo.");
       return;
@@ -1437,16 +1495,28 @@ export function MessageInput({
   // Clipboard images (screenshots) → staged attachments. Returning false
   // lets chat-input's default file-paste (native pasteboard → quoted paths)
   // handle everything else.
+  // A pasted screenshot is bytes with no path. Inline when the agent takes
+  // images; otherwise spooled to a scratch file and attached as a path chip,
+  // like the screenshot tool does — declining it left the paste to a handler
+  // that only knows Finder paths, and the image vanished without a word.
   const handlePasteImages = useCallback(
     (files: File[]) => {
-      if (!imageSupported) return false;
-      void Promise.all(files.map(fileToImageAttachment)).then((atts) => {
-        const ok = atts.filter((a): a is ImageAttachment => a !== null);
-        if (ok.length) setStagedImages((prev) => [...prev, ...ok]);
-      });
+      if (imageSupported) {
+        void Promise.all(files.map(fileToImageAttachment)).then((atts) => {
+          const ok = atts.filter((a): a is ImageAttachment => a !== null);
+          if (ok.length) setStagedImages((prev) => [...prev, ...ok]);
+        });
+        return true;
+      }
+      void Promise.all(files.map(scratchPathForFile))
+        .then(insertFileChips)
+        .catch((err) => {
+          console.warn("image paste failed:", err);
+          toast.error("Could not attach the pasted image.");
+        });
       return true;
     },
-    [imageSupported],
+    [imageSupported, insertFileChips],
   );
 
   // `submit` (below) is defined after `handleSlashSelect` but the latter
@@ -1657,19 +1727,38 @@ export function MessageInput({
     return () => window.removeEventListener("atlas:chat-reply", handler);
   }, []);
 
-  // Prefill the composer with raw text (empty-state prompt chips). Unlike
-  // "reply" this replaces the value verbatim (no quote block) and focuses.
+  // Prefill the composer with raw text (empty-state prompt chips, a user row's
+  // "Edit as new message"). Unlike "reply" this replaces the value verbatim (no
+  // quote block) and focuses. Tab-scoped like `atlas:chat-send`: a tabId-less
+  // event still reaches every mounted composer.
+  //
+  // Replacing is destructive, so a non-empty draft that differs from the new
+  // text is offered back through an Undo toast rather than silently dropped.
   useEffect(() => {
     const handler = (e: Event) => {
-      const detail = (e as CustomEvent<{ text: string }>).detail;
+      const detail = (e as CustomEvent<{ text: string; tabId?: string }>).detail;
       if (!detail?.text) return;
+      if (detail.tabId != null && detail.tabId !== tabId) return;
+      const previous = inputRef.current?.getValue() ?? valueRef.current;
       inputRef.current?.setValue(detail.text);
       setValue(detail.text);
       requestAnimationFrame(() => inputRef.current?.focus());
+      if (previous.trim() && previous !== detail.text) {
+        toast("Replaced your draft", {
+          action: {
+            label: "Undo",
+            onClick: () => {
+              inputRef.current?.setValue(previous);
+              setValue(previous);
+              requestAnimationFrame(() => inputRef.current?.focus());
+            },
+          },
+        });
+      }
     };
     window.addEventListener("atlas:chat-prefill", handler);
     return () => window.removeEventListener("atlas:chat-prefill", handler);
-  }, []);
+  }, [tabId, setValue]);
 
   // Focus the composer on demand. The sidebar "+ new chat" button fires this
   // when it reuses an already-empty tab: no remount happens in that case, so
@@ -1714,6 +1803,53 @@ export function MessageInput({
     return () => window.removeEventListener("atlas:chat-insert", handler);
   }, [tabId]);
 
+  // A comment popover's link button: this tab's own recorded session's
+  // comment, as a chip at the caret. Linking one already in the draft just
+  // focuses — the agent needs to be pointed at it once.
+  useEffect(() => {
+    const handler = (e: Event) => {
+      const detail = (e as CustomEvent<CommentLinkDetail>).detail;
+      if (!detail || detail.tabId !== tabId || disabled) return;
+      const input = inputRef.current;
+      if (!input) return;
+      const linked = input
+        .getMentions()
+        .some((m) => m.kind === "comment" && m.id === detail.mention.id);
+      if (!linked) {
+        const view = input.view();
+        const doc = view?.state.doc;
+        const head = view?.state.selection.main.head ?? 0;
+        const before = doc && head > 0 ? doc.sliceString(head - 1, head) : "";
+        if (before && !/\s/.test(before)) {
+          view?.dispatch({ changes: { from: head, insert: " " }, selection: { anchor: head + 1 } });
+        }
+        input.insertMention(detail.mention);
+      }
+      requestAnimationFrame(() => inputRef.current?.focus());
+    };
+    window.addEventListener(COMMENT_LINK_EVENT, handler);
+    return () => window.removeEventListener(COMMENT_LINK_EVENT, handler);
+  }, [tabId, disabled]);
+
+  // An agent switch with `agentSwitchBehavior: "handoff"`: the conversation
+  // the tab just left, as a past-session chip at the start of the draft, so
+  // the next message carries it to the new agent (`switch-agent.ts`).
+  useEffect(() => {
+    const handler = (e: Event) => {
+      const detail = (e as CustomEvent<SessionHandoffDetail>).detail;
+      if (!detail || detail.tabId !== tabId) return;
+      const input = inputRef.current;
+      if (!input) return;
+      const attached = input
+        .getMentions()
+        .some((m) => m.kind === "past_session" && m.id === detail.mention.id);
+      if (!attached) input.insertMention(detail.mention, 0, 0);
+      requestAnimationFrame(() => inputRef.current?.focus());
+    };
+    window.addEventListener(SESSION_HANDOFF_EVENT, handler);
+    return () => window.removeEventListener(SESSION_HANDOFF_EVENT, handler);
+  }, [tabId]);
+
   const submit = useCallback(() => {
     // Hard gate: Claude Code missing or not authed — sending would just
     // surface a confusing ACP spawn error. The banner above tells the user
@@ -1753,6 +1889,7 @@ export function MessageInput({
       // stay in the composer strip and ride the next direct send.
       enqueueMessage(tabId, trimmed);
     } else {
+      if (modeUnrestored) return;
       const images = stagedImages;
       onSend(trimmed, mentions, images.length ? images : undefined);
       if (images.length) setStagedImages([]);
@@ -1772,6 +1909,7 @@ export function MessageInput({
     disabled,
     stagedImages,
     githubSyncing,
+    modeUnrestored,
   ]);
   submitRef.current = submit;
 
@@ -1781,7 +1919,8 @@ export function MessageInput({
   //   not running + any → SEND
   type Mode = "send" | "queue" | "stop";
   const mode: Mode = running ? (hasText ? "queue" : "stop") : "send";
-  const buttonEnabled = disabled ? false : mode === "stop" ? true : hasText;
+  const buttonEnabled =
+    disabled || (mode === "send" && modeUnrestored) ? false : mode === "stop" ? true : hasText;
 
   // One fixed placeholder, always. The composer used to swap in a queue hint
   // while a turn ran and a no-grant explanation when AI access was missing;
@@ -1796,7 +1935,7 @@ export function MessageInput({
         {/* Queued messages above the input */}
         {queue.length > 0 && (
           <div className="mb-2 flex flex-col gap-1">
-            <div className="text-[10px] uppercase tracking-wider text-[var(--text-tertiary)] px-1">
+            <div className="text-2xs uppercase tracking-wider text-[var(--muted-foreground)] px-1">
               Queued · {queue.length}
             </div>
             <div className="flex flex-wrap gap-1.5">
@@ -1827,11 +1966,15 @@ export function MessageInput({
             Scoped to the native agent for the same reason the lock is: the
             other agents do not use the Atlas gateway, so an org with no grant
             is not their problem and a bar over a working composer is noise. */}
-        {agentType === "cersei" && <AiGrantBar />}
+        {agentType === "atlas-agent" && <AiGrantBar />}
 
         {/* The tab's agent was uninstalled — same strip, same reason: the
             input below cannot send until the chat is switched. */}
         <RemovedAgentBar tabId={tabId} />
+
+        {/* A resume could not restore the user's mode: nothing sends until
+            they pick one. */}
+        <ModeRestoreBar tabId={tabId} />
 
         {/* Live plan docked on top of the input bar (JetBrains-Air style). */}
 
@@ -1846,8 +1989,8 @@ export function MessageInput({
             // (`z-20` in chat-panel.tsx), not just the PlanDock. This element
             // has a z-index, so it opens a stacking context, and every dropup
             // inside it — the model picker, the agent/mode picker, the toolbar
-            // tooltip — is trapped in it: their `z-50` sorts them against each
-            // other and against nothing else. At `z-10` the whole composer,
+            // tooltip — is trapped in it: their `z-popover` sorts them against
+            // each other and against nothing else. At `z-10` the whole composer,
             // menus included, painted UNDER the "Scroll to bottom" pill, which
             // also swallowed clicks on the menu's first row (the pill sets
             // `pointer-events-auto`). Raising the context is the fix; raising
@@ -1856,10 +1999,10 @@ export function MessageInput({
             // its exposed bottom strip; the INNER surface below holds the
             // input + send button (the focus ring lives there — the "active
             // field" is the input surface, not the toolbar).
-            "relative z-30 rounded-2xl border border-[var(--border-default)] bg-[var(--bg-secondary)]",
-            "shadow-[0_8px_24px_rgba(0,0,0,0.35)]",
-            // Drag-over highlight: a clear accent ring while OS files hover.
-            isDropTarget && "border-[var(--accent-primary)] ring-2 ring-[var(--accent-primary)]/40",
+            "relative z-30 rounded-2xl border border-[var(--border)] bg-[var(--card)]",
+            // The footer pills' labels collapse against THIS width.
+            "@container",
+            "shadow-md",
             // NOTE: the disabled dim is NOT applied here. It used to be
             // (`disabled && "opacity-60"` on this shell), and it faded the
             // whole composer — footer pills, the agent switcher, and every
@@ -1873,20 +2016,50 @@ export function MessageInput({
           onFocusCapture={handleFocusCapture}
         >
           {githubSyncing !== null && (
-            <div className="pointer-events-none absolute inset-0 z-10 flex items-center justify-center rounded-2xl bg-[var(--bg-base)]/40 backdrop-blur-[1px]">
-              <span className="flex items-center gap-2 rounded-full bg-[var(--bg-elevated)] px-3 py-1 text-[11px] font-medium text-[var(--text-secondary)] shadow">
+            <div className="pointer-events-none absolute inset-0 z-10 flex items-center justify-center rounded-2xl bg-[var(--background)]/40 backdrop-blur-[1px]">
+              <span className="flex items-center gap-2 rounded-full bg-[var(--card)] px-3 py-1 text-xs font-medium text-[var(--secondary-foreground)] shadow">
                 <Loader2 size={12} className="animate-spin" />
                 Syncing {githubSyncing}…
               </span>
             </div>
           )}
-          {isDropTarget && (
-            <div className="pointer-events-none absolute inset-0 z-10 flex items-center justify-center rounded-2xl bg-[var(--accent-primary)]/8 backdrop-blur-[1px]">
-              <span className="rounded-full bg-[var(--bg-elevated)] px-3 py-1 text-[11px] font-medium text-[var(--text-secondary)] shadow">
-                Drop files to attach
-              </span>
-            </div>
-          )}
+          {dropZoneEl &&
+            createPortal(
+              // In with no transition: this is direct feedback to the pointer
+              // crossing into the zone, and any fade reads as lag behind the
+              // hand. Out over `duration-instant`, so it doesn't vanish in the
+              // same frame the dropped attachment appears. Always mounted
+              // (toggled by `data-active`) so the exit can transition at all.
+              // Opacity only; nothing travels, so reduced motion needs no variant.
+              // `z-40` clears the composer's own `z-30` in the same stacking
+              // context; a named layer would escape the column and cover toasts.
+              <div
+                aria-hidden="true"
+                data-active={isDropTarget}
+                className={cn(
+                  "pointer-events-none absolute inset-2 z-40 flex items-center justify-center",
+                  // The scrim dims the thread behind: the label must read as the one
+                  // live layer, not float among the welcome tiles.
+                  "rounded-xl border border-dashed border-[var(--primary)] bg-[var(--background)]/80",
+                  "opacity-0 transition-opacity duration-instant ease-out-strong",
+                  "data-[active=true]:opacity-100 data-[active=true]:duration-0",
+                )}
+              >
+                <div className="flex flex-col items-center gap-1 rounded-xl border border-[var(--border)] bg-[var(--card)] px-4 py-3 shadow-md">
+                  <AtSign size={16} className="text-[var(--primary)]" />
+                  <span className="text-sm font-medium text-[var(--foreground)]">
+                    Drop to reference
+                  </span>
+                  {/* Says what will happen, because the two gestures now differ:
+                      a drop writes a chip into the sentence, the "+" menu
+                      attaches. */}
+                  <span className="text-xs text-[var(--muted-foreground)]">
+                    Added as an @mention in your message
+                  </span>
+                </div>
+              </div>,
+              dropZoneEl,
+            )}
           {/* Inner input surface — nested card with its own border + focus
               glow, sitting proud of the muted shell (reference: the Skiper
               double-layer composer). The send button lives INSIDE it. */}
@@ -1899,12 +2072,12 @@ export function MessageInput({
               // `.atlas-chat-cm-host` block) the field collapses and the
               // button hangs out over the footer. The floor makes the
               // geometry hold even with no editor mounted at all.
-              "relative m-1 min-h-[44px] rounded-xl border border-[var(--border-default)] bg-[var(--bg-base)]",
+              "relative m-1 min-h-[44px] rounded-xl border border-[var(--border)] bg-[var(--background)]",
               "transition-[border-color,box-shadow] duration-150",
               // Focus treatment at HALF strength: the full border-focus +
               // /20 accent ring read far too loud on the nested surface.
-              "focus-within:border-[color-mix(in_srgb,var(--border-focus)_50%,var(--border-default))]",
-              "focus-within:ring-1 focus-within:ring-[var(--accent-primary)]/10",
+              "focus-within:border-[color-mix(in_srgb,var(--atlas-border-strong)_50%,var(--border))]",
+              "focus-within:ring-1 focus-within:ring-[var(--primary)]/10",
               // The disabled dim, scoped to the field the lock actually
               // applies to (see the shell above). No red tint — the send
               // button is already disabled and submit()/Cmd+Enter are gated
@@ -1912,39 +2085,11 @@ export function MessageInput({
               disabled && "opacity-60",
             )}
           >
-            {stagedImages.length > 0 && (
-              <div className="flex flex-wrap gap-2 px-3 pt-3">
-                {stagedImages.map((img, i) => {
-                  const src = `data:${img.mimeType};base64,${img.dataBase64}`;
-                  return (
-                    <div key={i} className="relative group">
-                      <img
-                        src={src}
-                        alt="attachment"
-                        className="h-14 w-14 object-cover rounded-lg border border-[var(--border-default)]"
-                      />
-                      <button
-                        onClick={() => setStagedImages((prev) => prev.filter((_, j) => j !== i))}
-                        className="absolute -top-1.5 -right-1.5 hidden group-hover:flex items-center justify-center w-4 h-4 rounded-full bg-[var(--bg-elevated)] border border-[var(--border-default)] text-[var(--text-secondary)] hover:text-[var(--text-primary)] cursor-pointer"
-                        title="Remove image"
-                      >
-                        <X size={9} />
-                      </button>
-                      {/* Zed-style hover preview — a larger floating image above the
-                        thumbnail. `pointer-events-none` so it never blocks the
-                        remove button; only shown on hover. */}
-                      <div className="pointer-events-none absolute bottom-full left-0 z-50 mb-2 hidden group-hover:block">
-                        <img
-                          src={src}
-                          alt=""
-                          className="max-h-[320px] max-w-[400px] rounded-lg border border-[var(--border-default)] object-contain bg-[var(--bg-elevated)] shadow-[var(--shadow-overlay)]"
-                        />
-                      </div>
-                    </div>
-                  );
-                })}
-              </div>
-            )}
+            <ImageAttachmentStrip
+              images={stagedImages}
+              onRemove={removeStagedImage}
+              className="px-3 pt-3"
+            />
             {/* Only the text area is pointer-blocked while `disabled`:
               `pointer-events-none` stops click-to-focus/typing AND the focus
               event, so we never trigger the agent-bind listener against a CLI
@@ -1964,6 +2109,7 @@ export function MessageInput({
                   onMentionTrigger={setTrigger}
                   onSlashTrigger={setSlashTrigger}
                   onPasteImages={handlePasteImages}
+                  onPastePaths={attachPaths}
                   keyInterceptor={keyInterceptor}
                 />
               ) : (
@@ -1973,64 +2119,71 @@ export function MessageInput({
                 <div aria-hidden="true" style={{ minHeight: 44 }} className="px-4 pt-3 pb-1" />
               )}
             </div>
-            <button
-              onClick={submit}
-              disabled={!buttonEnabled}
-              className={cn(
-                // Reference-style squircle send: a soft rounded-square,
-                // transparent at rest, muted fill + border on hover, pinned
-                // top-right of the input surface (it does not ride down as
-                // the field grows — same as the Skiper component).
-                // Geometry IN PX, not rem: Atlas's UI-scale setting shrinks
-                // the root font-size, so rem utilities (w-7/top-2 → 23px/6.5px
-                // under scale) drift against CodeMirror's hardcoded 12px/16px
-                // padding — the ruler-measured misalignment. CM's first text
-                // line centers at 12px pad + ~10px half-line = 22px; a 28px
-                // button at 8px top centers at 22px at EVERY UI scale.
-                "absolute top-[8px] right-[8px] flex items-center justify-center w-[28px] h-[28px] rounded-lg border transition-colors",
-                buttonEnabled
-                  ? "border-transparent text-[var(--text-primary)] hover:bg-[var(--bg-hover)] hover:border-[var(--border-default)] cursor-pointer"
-                  : "border-transparent text-[var(--text-tertiary)] cursor-not-allowed",
-              )}
-              title={
+            {/* No wrapping span: it would sit in flow and misplace this absolute button. */}
+            <Hint
+              side="top"
+              wrap={false}
+              label={
                 mode === "stop"
                   ? stopping
                     ? "Stopping… (waiting for the agent to wind down)"
                     : "Stop generation"
                   : mode === "queue"
                     ? "Queue message (sends after current finishes)"
-                    : `Send to agent (${enterToSend ? "↵" : "⌘↵"})`
+                    : "Send to agent"
               }
+              shortcut={mode === "send" ? (enterToSend ? "↵" : "⌘↵") : undefined}
             >
-              {/* Keyed span so the arrow↔stop swap plays the scale-pop morph
-                (existing `animate-scale-in` — ends at identity, no fill). */}
-              <span
-                key={mode === "stop" ? "stop" : "send"}
-                className="flex items-center justify-center animate-scale-in"
-              >
-                {mode === "stop" ? (
-                  <Square
-                    size={11}
-                    strokeWidth={3}
-                    fill="currentColor"
-                    className={stopping ? "animate-pulse" : undefined}
-                  />
-                ) : (
-                  <ArrowUp size={15} strokeWidth={2.5} />
+              <button
+                onClick={submit}
+                disabled={!buttonEnabled}
+                className={cn(
+                  // Reference-style squircle send: a soft rounded-square,
+                  // transparent at rest, muted fill + border on hover, pinned
+                  // top-right of the input surface (it does not ride down as
+                  // the field grows — same as the Skiper component).
+                  // Geometry IN PX, not rem: Atlas's UI-scale setting shrinks
+                  // the root font-size, so rem utilities (w-7/top-2 → 23px/6.5px
+                  // under scale) drift against CodeMirror's hardcoded 12px/16px
+                  // padding — the ruler-measured misalignment. CM's first text
+                  // line centers at 12px pad + ~10px half-line = 22px; a 28px
+                  // button at 8px top centers at 22px at EVERY UI scale.
+                  "absolute top-[8px] right-[8px] flex items-center justify-center w-[28px] h-[28px] rounded-lg border transition-colors",
+                  buttonEnabled
+                    ? "border-transparent text-[var(--foreground)] hover:bg-[var(--atlas-element-hover)] hover:border-[var(--border)] cursor-pointer"
+                    : "border-transparent text-[var(--muted-foreground)] cursor-not-allowed",
                 )}
-              </span>
-            </button>
+              >
+                {/* Updates in place: Enter sends, so the arrow↔stop swap is
+                    keyboard-driven and has no animation. */}
+                <span className="flex items-center justify-center">
+                  {mode === "stop" ? (
+                    <Square
+                      size={11}
+                      strokeWidth={3}
+                      fill="currentColor"
+                      className={stopping ? "animate-pulse" : undefined}
+                    />
+                  ) : (
+                    <ArrowUp size={15} strokeWidth={2.5} />
+                  )}
+                </span>
+              </button>
+            </Hint>
           </div>
-          {/* Footer strip — the exposed band of the outer shell. */}
-          <div className="flex items-center justify-between px-2 pb-1.5 pt-1">
-            <div className="flex items-center gap-1">
+          {/* Footer strip — the exposed band of the outer shell. Pill labels
+              collapse to icons as the shell narrows (`composerPillLabelClass`),
+              so the row never wraps or runs past the edge. No overflow clip:
+              the pills' dropups are children and would be cut off. */}
+          <div className="flex items-center justify-between gap-2 px-2 pb-1.5 pt-1">
+            <div className="flex min-w-0 items-center gap-1">
               <ComposerAddMenu
                 // `disabledProp`, NOT `disabled`: a missing org AI grant locks
                 // the input, not the toolbar. Greying the + here made the whole
                 // footer read as dead while the fix (switch agent, request a
                 // grant) is one row away.
                 disabled={disabledProp || githubSyncing !== null}
-                projectPath={useProjectStore.getState().currentProject?.path ?? null}
+                projectPath={useAppStore.getState().currentProject?.path ?? null}
                 agentId={switchableAgent}
                 imageSupported={imageSupported}
                 onAddFilesOrPhotos={() => void pickFilesOrPhotos()}
@@ -2038,7 +2191,7 @@ export function MessageInput({
                 onTakeScreenshot={(mode) => void handleTakeScreenshot(mode)}
                 onCloneRepo={(repo) => void handleCloneRepo(repo)}
                 onPickSession={handlePickSession}
-                onPickWorkspace={handlePickWorkspace}
+                onPickProject={handlePickProject}
               />
               {/* Agent / mode / model as one grouped, animated picker — the
                   pills double as its tab strip. Cycling shortcuts (⌥/ agents,
@@ -2054,8 +2207,8 @@ export function MessageInput({
                   gateway agent cannot use. Model choice now goes through the
                   same ACP model pill as every other agent, fed by the seam's
                   published catalogue. */}
-              {agentType === "cersei" && <EffortPill tabId={tabId} />}
-              {agentType === "cersei" && <CerseiMemoryPill />}
+              {agentType === "atlas-agent" && <EffortPill tabId={tabId} />}
+              {agentType === "atlas-agent" && <NativeMemoryPill />}
             </div>
             {/* Right side, in this order: the session's usage, the agent's own
                 knobs, then the live
@@ -2063,7 +2216,7 @@ export function MessageInput({
                 progress + count; opens its own morphing task-list panel, and
                 replaces the PlanDock strip that used to sit above the
                 composer). Both are right-anchored dropups. */}
-            <div className="flex items-center gap-1">
+            <div className="flex shrink-0 items-center gap-1">
               <UsagePill tabId={tabId} />
               <ComposerOptionsPill tabId={tabId} />
               <PlanTasksPill tabId={tabId} />
@@ -2083,6 +2236,7 @@ export function MessageInput({
           // only list ones enabled for the active agent (registry ids
           // "claude-code" / "codex" match agentType).
           agentId={agentType}
+          tabId={tabId}
           onSelect={handleMentionSelect}
           onClose={() => setTrigger(null)}
         />
@@ -2116,22 +2270,23 @@ function QueueChip({
   onRemove: () => void;
 }) {
   return (
-    <div className="group flex items-center gap-1 max-w-[260px] h-6 pl-2 pr-1 rounded-full border border-[var(--border-default)] bg-[var(--bg-elevated)] text-[11px] text-[var(--text-secondary)]">
+    <div className="group flex items-center gap-1 max-w-[260px] h-6 pl-2 pr-1 rounded-full border border-[var(--border)] bg-[var(--card)] text-xs text-[var(--secondary-foreground)]">
       <button
         onClick={onEdit}
-        className="flex items-center gap-1 min-w-0 cursor-pointer hover:text-[var(--text-primary)]"
+        className="flex items-center gap-1 min-w-0 cursor-pointer hover:text-[var(--foreground)]"
         title="Edit / merge into input"
       >
-        <Pencil size={9} className="text-[var(--text-tertiary)] shrink-0" />
+        <Pencil size={9} className="text-[var(--muted-foreground)] shrink-0" />
         <span className="truncate">{text.replace(/\s+/g, " ")}</span>
       </button>
-      <button
-        onClick={onRemove}
-        className="flex items-center justify-center w-4 h-4 rounded-full hover:bg-[var(--bg-hover)] text-[var(--text-tertiary)] hover:text-[var(--status-error)] cursor-pointer shrink-0"
-        title="Remove from queue"
-      >
-        <X size={10} />
-      </button>
+      <Hint label="Remove from queue" side="top">
+        <button
+          onClick={onRemove}
+          className="flex items-center justify-center w-4 h-4 rounded-full hover:bg-[var(--atlas-element-hover)] text-[var(--muted-foreground)] hover:text-[var(--atlas-status-error-foreground)] cursor-pointer shrink-0"
+        >
+          <X size={10} />
+        </button>
+      </Hint>
     </div>
   );
 }

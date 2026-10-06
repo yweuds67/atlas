@@ -54,6 +54,16 @@ to reset your analytics identity.**
 change — so a single install appeared in PostHog as a crowd of one-launch strangers.
 An install upgrading from 0.2.3 keeps the id it already had.)
 
+**A dev-profile build is a separate install.** `bun run dev:app` runs as "Atlas Dev",
+with its own `<app_config_dir>` and its own `~/.config/atlas-dev/config.toml` (see
+[CONTRIBUTING.md](CONTRIBUTING.md)). When a PostHog key resolves for it (from the
+environment or a `.env` in your checkout; the installed app's `telemetry.json` is in
+the other app dir), it sends telemetry like any other build, under a device id of its
+own, so PostHog sees it as a second device beside your installed Atlas. Its "Share
+usage data" toggle is its own too, and starts at the default rather than at what you
+chose in the installed app. Without a key it is inert, like any source build, and it
+never runs the update check.
+
 **Signed in**, Atlas sends PostHog an `$identify` that switches the identity to your
 Atlas account id and carries `$anon_distinct_id` — the device id. PostHog **merges the
 device person into the account person**, which means events that device sent *before*
@@ -136,8 +146,8 @@ relaunch. Switching directly from one account to another never carries
 | `agent_turn_started` | A turn begins | `agent_family`, `plugin_id`, `session_ref`, `turn_seq` |
 | `agent_turn_completed` | A turn ends, however it ends | see below |
 
-`agent_family` is `acp` or `cersei`; `plugin_id` is the real agent (`claude-code-ts`,
-`codex`, `cersei`). `session_ref` is a salted, non-reversible 16-character digest that
+`agent_family` is `acp` or `native`; `plugin_id` is the real agent (`claude-code-ts`,
+`codex`, `atlas-agent`). `session_ref` is a salted, non-reversible 16-character digest that
 joins a start to its completion — never the agent's real session id, which for Claude
 Code appears in on-disk transcript paths. The salt is minted per launch and never
 persisted.
@@ -155,7 +165,8 @@ persisted.
 - **Tokens** — `turn_input_tokens`, `turn_output_tokens`, `turn_cost_usd` for the
   native agent; `context_used`, `context_size`, `context_pct` for ACP agents, which
   cannot report a token split. `token_source` (`usage` / `context` / `none`) says
-  which. Absent rather than zero when unknown.
+  which. Absent rather than zero when unknown. `turn_cost_usd` is only ever a USD
+  amount: a cost an agent reports in another currency is left out, not converted.
 - **Session shape** — `permission_requests`, `permissions_resolved`, `retries`,
   `compactions`, `compression_saved_tokens`, `assistant_messages`, `plan_updates`,
   `mode_changes`, `model_id`

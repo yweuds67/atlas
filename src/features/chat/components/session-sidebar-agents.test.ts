@@ -9,18 +9,25 @@ import { describe, expect, it, vi } from "vitest";
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
 vi.mock("@tauri-apps/api/event", () => ({ listen: vi.fn() }));
 
-const { sidebarAgentOf, AGENT_TYPE_BY_SIDEBAR } = await import("./session-sidebar");
+const { sidebarAgentOf, AGENT_TYPE_BY_SIDEBAR } = await import("../lib/sidebar-agents");
 
 describe("sidebarAgentOf (agent id → transcript-store band)", () => {
   it("folds canonical registry ids into the store band their transcripts land in", () => {
-    // A live codex-acp session and the ~/.codex disk row it produces MUST be
-    // one band, or twin suppression / row icon / delete routing all miss.
+    // A registry id and the older native id a thread row may carry MUST be
+    // one band, or the row icon and resume routing split.
     expect(sidebarAgentOf("codex-acp")).toBe("codex");
     expect(sidebarAgentOf("claude-acp")).toBe("claude");
+    expect(sidebarAgentOf("claude-code")).toBe("claude");
+    expect(sidebarAgentOf("claude-code-ts")).toBe("claude");
+  });
+
+  it("does not fold an external agent whose id merely starts with claude", () => {
+    // It would otherwise resume its history through claude-acp.
+    expect(sidebarAgentOf("claude-foo")).toBe("claude-foo");
   });
 
   it("keeps the bands whose registry id already names the store", () => {
-    for (const id of ["opencode", "cursor", "kilo", "cersei"]) {
+    for (const id of ["opencode", "cursor", "kilo", "atlas-agent"]) {
       expect(sidebarAgentOf(id)).toBe(id);
     }
   });
@@ -38,7 +45,7 @@ describe("AGENT_TYPE_BY_SIDEBAR (band → spawnable registry id)", () => {
     expect(AGENT_TYPE_BY_SIDEBAR.codex).toBe("codex-acp");
     expect(AGENT_TYPE_BY_SIDEBAR.opencode).toBe("opencode");
     expect(AGENT_TYPE_BY_SIDEBAR.kilo).toBe("kilo");
-    expect(AGENT_TYPE_BY_SIDEBAR.cersei).toBe("cersei");
+    expect(AGENT_TYPE_BY_SIDEBAR["atlas-agent"]).toBe("atlas-agent");
   });
 
   it("round-trips: a resumed session's band maps back to itself", () => {

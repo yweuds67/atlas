@@ -51,13 +51,14 @@ import { pinScope } from "../stores/chat-pins-store";
 import { cn } from "@/lib/utils";
 import { isScrollHot } from "@/lib/scroll-hot";
 import { GradualBlur } from "@/components/gradual-blur";
-import { LoadingState } from "./loading-state";
+import { LoadingState, WAITING_LABEL } from "./loading-state";
 import {
   UserRowView,
   ProseRowView,
   ThinkingRowView,
   MarkerRowView,
   MarkerGroupRowView,
+  WorkHeaderRowView,
   SeparatorRowView,
   TurnFooterRowView,
 } from "./transcript-rows";
@@ -65,9 +66,10 @@ import {
 /**
  * How many rows are added each time the window grows.
  *
- * Sized in ROWS, not turns: a tool-heavy turn is a dozen 24px markers, so 40
- * rows is a couple of turns — enough to stay ahead of the reader, small enough
- * that mounting them (and parsing whatever markdown they carry) is not a hitch.
+ * Sized in ROWS, not turns: a collapsed tool sequence counts as one row, and an
+ * opened one counts as one row carrying its calls (26px each, laid out in the
+ * thread rather than in a nested scroller). Forty rows stay ahead of the reader
+ * without mounting the full history at once.
  * Bursting 80 at once was visibly worse even after the blank was fixed.
  */
 const WINDOW_CHUNK = 40;
@@ -98,6 +100,10 @@ const TOP_BLUR_RAMP = 34;
 
 /** Gap left above an anchored row, so it doesn't sit flush against the top. */
 const ANCHOR_GAP = 24;
+/** The ring a comment jump leaves on the row it landed on, and for how long.
+ *  Same treatment as the Timeline's `landed` row. */
+const LANDED_CLASSES = ["ring-1", "ring-[var(--atlas-border-strong)]", "rounded-lg"];
+const LANDED_MS = 2_000;
 
 /** Breathing room between the last row and the composer. Applied as content
  *  padding rather than a spacer element so it scrolls with the thread and the
@@ -123,6 +129,10 @@ interface TranscriptProps {
   acpSessionId: string;
   messages: ChatMessage[];
   isStreaming: boolean;
+  /** The turn is still in progress, including while it is paused on the user
+   *  (a permission or plan approval). `isStreaming` goes false for that pause;
+   *  the work header must not read it as the turn being over and fold it. */
+  turnInProgress?: boolean;
   agentType?: string;
   /** Vertical space (px) reserved at the top for the floating header, applied as
    *  content padding so the first row clears it while still scrolling under. */
@@ -130,8 +140,9 @@ interface TranscriptProps {
   onShowJumpChange?: (visible: boolean, newCount?: number) => void;
   /** What the working indicator says while the session is still binding and
    *  the first message is held (see `ChatSession.pendingSend`) — "Starting
-   *  Claude Code" rather than "Thinking", which would claim a turn that has
-   *  not been dispatched yet. */
+   *  Claude Code", which names the one thing actually happening. Absent, the
+   *  indicator falls back to `WAITING_LABEL`: a turn that HAS been dispatched
+   *  is waiting on the model, which is a different claim again. */
   workingLabel?: string;
   /** Offered under the working indicator once a start has stalled (30 s with
    *  no session): restart the agent's process, or switch this tab to another
@@ -180,7 +191,7 @@ function saveScroll(cacheKey: string, saved: Saved): void {
  * and departure don't jolt the thread it sits under.
  */
 function WorkingIndicator({
-  label = "Thinking",
+  label = WAITING_LABEL,
   onStallRestart,
   onStallSwitch,
   onStallCopyDiagnostics,
@@ -223,13 +234,13 @@ function StallNotice({
   onCopyDiagnostics?: () => void;
 }) {
   return (
-    <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5 pl-[17px] text-[11px] leading-[16px] text-[var(--text-tertiary)]">
+    <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5 pl-[17px] text-xs leading-[16px] text-[var(--muted-foreground)]">
       <span className="select-text">Still starting… this can take a few minutes on first run.</span>
       {onRestart && (
         <button
           type="button"
           onClick={onRestart}
-          className="cursor-pointer font-medium text-[var(--text-secondary)] underline-offset-2 hover:text-[var(--text-primary)] hover:underline"
+          className="cursor-pointer font-medium text-[var(--secondary-foreground)] underline-offset-2 hover:text-[var(--foreground)] hover:underline"
         >
           Restart agent
         </button>
@@ -238,7 +249,7 @@ function StallNotice({
         <button
           type="button"
           onClick={onSwitch}
-          className="cursor-pointer font-medium text-[var(--text-secondary)] underline-offset-2 hover:text-[var(--text-primary)] hover:underline"
+          className="cursor-pointer font-medium text-[var(--secondary-foreground)] underline-offset-2 hover:text-[var(--foreground)] hover:underline"
         >
           Switch agent
         </button>
@@ -247,7 +258,7 @@ function StallNotice({
         <button
           type="button"
           onClick={onCopyDiagnostics}
-          className="cursor-pointer font-medium text-[var(--text-secondary)] underline-offset-2 hover:text-[var(--text-primary)] hover:underline"
+          className="cursor-pointer font-medium text-[var(--secondary-foreground)] underline-offset-2 hover:text-[var(--foreground)] hover:underline"
         >
           Copy diagnostics
         </button>
@@ -262,6 +273,7 @@ export const Transcript = forwardRef<TranscriptHandle, TranscriptProps>(function
     acpSessionId,
     messages,
     isStreaming,
+    turnInProgress = isStreaming,
     agentType,
     topInset = 0,
     onShowJumpChange,
@@ -330,13 +342,13 @@ export const Transcript = forwardRef<TranscriptHandle, TranscriptProps>(function
   const canRetry = useChatStore((s) => sessionCanRetry(s.sessions[tabId], supportsRewind));
 
   const [expanded, setExpanded] = useState<ReadonlySet<string>>(() => new Set());
-  /** Turns whose tool-call block the reader has opened. */
+  /** Tool sequences the reader has opened. */
   const [expandedTurns, setExpandedTurns] = useState<ReadonlySet<string>>(() => new Set());
-  const toggleTurn = useCallback((turnId: string) => {
+  const toggleTurn = useCallback((groupId: string) => {
     setExpandedTurns((prev) => {
       const next = new Set(prev);
-      if (next.has(turnId)) next.delete(turnId);
-      else next.add(turnId);
+      if (next.has(groupId)) next.delete(groupId);
+      else next.add(groupId);
       return next;
     });
   }, []);
@@ -366,12 +378,12 @@ export const Transcript = forwardRef<TranscriptHandle, TranscriptProps>(function
     if (!live && prevProjectionRef.current) return prevProjectionRef.current;
     const next = projectRows(
       messages,
-      { expanded, expandedTurns, streaming: isStreaming },
+      { expanded, expandedTurns, streaming: isStreaming, turnInProgress },
       prevProjectionRef.current,
     );
     prevProjectionRef.current = next;
     return next;
-  }, [messages, expanded, expandedTurns, isStreaming, live]);
+  }, [messages, expanded, expandedTurns, isStreaming, turnInProgress, live]);
   const rows: Row[] = projection.rows;
 
   // ── Is the live turn still silent? ───────────────────────────────────
@@ -390,7 +402,7 @@ export const Transcript = forwardRef<TranscriptHandle, TranscriptProps>(function
   const [startIndex, setStartIndex] = useState(() => Math.max(0, rows.length - WINDOW_INITIAL));
 
   // A projection that SHRINKS — "New chat" resetting the session in place, a
-  // workspace switch dropping history, a role filter — leaves `startIndex`
+  // project switch dropping history, a role filter — leaves `startIndex`
   // pointing into a thread that no longer exists. Every other writer only ever
   // moves the start DOWN (growth, jump-to-message) or sets it to this floor, so
   // a start above the floor is unreachable except by a shrink: that is the
@@ -648,6 +660,35 @@ export const Transcript = forwardRef<TranscriptHandle, TranscriptProps>(function
     pendingAnchorRef.current = lastUser >= 0 ? rows[lastUser].id : null;
   }, [cacheKey, rows, live]);
 
+  // A jump from the comments panel names the row to light up once the turn is
+  // on screen — the row itself when it is in the DOM (a response, a prompt),
+  // else the "Worked" header hiding it. Applied imperatively: the ring is a
+  // two-second decoration, not row state, and routing it through the memoized
+  // row list would re-render every mounted row for it.
+  const pendingHighlightRef = useRef<string[] | null>(null);
+  const landedRef = useRef<{ node: HTMLElement; timer: ReturnType<typeof setTimeout> } | null>(
+    null,
+  );
+  const markLanded = useCallback((row: HTMLElement) => {
+    // The ring goes on the row's content column, not the full-width wrapper
+    // — the same footprint the Timeline's landed entry has.
+    const node = (row.firstElementChild as HTMLElement | null) ?? row;
+    const prev = landedRef.current;
+    if (prev) {
+      clearTimeout(prev.timer);
+      prev.node.classList.remove(...LANDED_CLASSES);
+    }
+    node.classList.add(...LANDED_CLASSES);
+    landedRef.current = {
+      node,
+      timer: setTimeout(() => {
+        node.classList.remove(...LANDED_CLASSES);
+        landedRef.current = null;
+      }, LANDED_MS),
+    };
+  }, []);
+  useEffect(() => () => void (landedRef.current && clearTimeout(landedRef.current.timer)), []);
+
   useLayoutEffect(() => {
     const id = pendingAnchorRef.current;
     if (!id) return;
@@ -655,15 +696,26 @@ export const Transcript = forwardRef<TranscriptHandle, TranscriptProps>(function
     const node = el?.querySelector<HTMLElement>(`[data-row-id="${CSS.escape(id)}"]`);
     if (!el || !node) return;
     pendingAnchorRef.current = null;
+    let landed: HTMLElement | null = null;
+    const wanted = pendingHighlightRef.current;
+    if (wanted) {
+      pendingHighlightRef.current = null;
+      for (const rowId of wanted) {
+        landed = el.querySelector<HTMLElement>(`[data-row-id="${CSS.escape(rowId)}"]`);
+        if (landed) break;
+      }
+    }
+    const anchor = landed ?? node;
     // `offsetTop` is measured from the positioned ancestor, so it is
     // independent of the current scroll position.
-    el.scrollTop = Math.max(0, node.offsetTop - ANCHOR_GAP);
+    el.scrollTop = Math.max(0, anchor.offsetTop - ANCHOR_GAP);
     // Hold this row in place while the screenful of markdown around it
     // finishes parsing. Without this the reader watches the thread creep as
     // each block swaps from placeholder to formatted.
-    stickyRef.current = { rowId: id, offset: ANCHOR_GAP };
+    stickyRef.current = { rowId: anchor.dataset.rowId ?? id, offset: ANCHOR_GAP };
     stickyUntil.current = performance.now() + STICKY_SETTLE_MS;
     invalidate();
+    if (landed) markLanded(landed);
   });
 
   // Any deliberate input means the reader has taken over — stop correcting
@@ -732,7 +784,7 @@ export const Transcript = forwardRef<TranscriptHandle, TranscriptProps>(function
   // Persist position on unmount so reopening returns the reader. A tab switch
   // no longer unmounts (the panel stays mounted and laid out behind the active
   // tab, keeping `scrollTop` in the DOM); this covers closing the tab or the
-  // workspace and coming back.
+  // project and coming back.
   useEffect(() => {
     return () => {
       const el = scrollRef.current;
@@ -813,8 +865,11 @@ export const Transcript = forwardRef<TranscriptHandle, TranscriptProps>(function
 
   useEffect(() => {
     const handler = (e: Event) => {
-      const detail = (e as CustomEvent<{ index: number }>).detail;
-      if (typeof detail?.index === "number") scrollToMessage(detail.index);
+      const detail = (e as CustomEvent<{ index: number; highlightRowIds?: string[] }>).detail;
+      if (typeof detail?.index === "number") {
+        pendingHighlightRef.current = detail.highlightRowIds ?? null;
+        scrollToMessage(detail.index);
+      }
     };
     window.addEventListener("atlas:chat-jump", handler);
     return () => window.removeEventListener("atlas:chat-jump", handler);
@@ -843,11 +898,9 @@ export const Transcript = forwardRef<TranscriptHandle, TranscriptProps>(function
       visible.map((row, i) => (
         // `group` is the hover scope for the user row's action bar
         // (`user-row-actions.tsx`), which is hidden until the row is hovered.
-        // It is the only `group-hover:` selector in the thread, and it is not
-        // free — see the fling hover-suspension in `use-transcript-scroll.ts`,
-        // which exists specifically to stop it firing for every row that
-        // passes under a resting pointer mid-scroll. Don't add a second one.
-        <div key={row.id} className="atlas-row group" data-row-id={row.id}>
+        // The fling hover-suspension in `use-transcript-scroll.ts` keeps hover
+        // styles from firing as rows pass under a resting pointer mid-scroll.
+        <div key={row.id} className="atlas-row group group/row" data-row-id={row.id}>
           <RowView
             row={row}
             tabId={tabId}
@@ -897,7 +950,7 @@ export const Transcript = forwardRef<TranscriptHandle, TranscriptProps>(function
           }}
         >
           {rows.length === 0 && !isStreaming && (
-            <div className="flex h-full items-center justify-center text-[11px] text-[var(--text-tertiary)]">
+            <div className="flex h-full items-center justify-center text-xs text-[var(--muted-foreground)]">
               No messages yet.
             </div>
           )}
@@ -927,8 +980,8 @@ export const Transcript = forwardRef<TranscriptHandle, TranscriptProps>(function
         // Mostly-opaque behind the bar itself, ramping to clear below it.
         // Without a tint the header read as a transparent pane over live text;
         // `color-mix` keeps it theme-correct rather than hardcoding black.
-        tint="color-mix(in srgb, var(--bg-surface) 90%, transparent)"
-        style={{ zIndex: 3 }}
+        tint="color-mix(in srgb, var(--background) 90%, transparent)"
+        className="z-panel"
       />
 
       {/* Bottom stays a plain colour fade. The blur was tried here and the
@@ -943,7 +996,7 @@ export const Transcript = forwardRef<TranscriptHandle, TranscriptProps>(function
           // scroll repaints a 1-2px hairline of text flashed through the seam
           // above the composer. The overshoot is solid bg-surface over the
           // inter-panel gap — invisible, and it absorbs the rounding both ways.
-          "pointer-events-none absolute -bottom-[2px] left-0 right-0 z-[1] h-[44px] transition-opacity duration-200",
+          "pointer-events-none absolute -bottom-[2px] left-0 right-0 z-panel h-[44px] transition-opacity duration-200",
           more ? "opacity-100" : "opacity-0",
         )}
         style={{
@@ -952,7 +1005,7 @@ export const Transcript = forwardRef<TranscriptHandle, TranscriptProps>(function
           // band just above the composer let white text ghost through the
           // seam (subtle but visible on AMOLED black).
           background:
-            "linear-gradient(to bottom, transparent, var(--bg-surface) 72%, var(--bg-surface))",
+            "linear-gradient(to bottom, transparent, var(--background) 72%, var(--background))",
         }}
       />
     </div>
@@ -1005,15 +1058,25 @@ function RowView({
         />
       );
     case RowKind.Prose:
-      return <ProseRowView row={row} agentLabel={agentLabel} priority={priority} />;
+      return (
+        <ProseRowView
+          row={row}
+          tabId={tabId}
+          agentLabel={agentLabel}
+          priority={priority}
+          pinScopeKey={pinScopeKey}
+        />
+      );
     case RowKind.Thinking:
-      return <ThinkingRowView row={row} onToggleExpand={onToggleExpand} />;
+      return <ThinkingRowView row={row} tabId={tabId} onToggleExpand={onToggleExpand} />;
     case RowKind.Marker:
       return <MarkerRowView row={row} tabId={tabId} />;
     case RowKind.MarkerGroup:
-      return <MarkerGroupRowView row={row} onExpandTurn={onExpandTurn} />;
+      return <MarkerGroupRowView row={row} tabId={tabId} onExpandTurn={onExpandTurn} />;
     case RowKind.Separator:
       return <SeparatorRowView row={row} />;
+    case RowKind.WorkHeader:
+      return <WorkHeaderRowView row={row} onToggle={onExpandTurn} />;
     case RowKind.TurnFooter:
       // made a fresh closure per render and defeated the memo on footer rows.
       return <TurnFooterRowView row={row} onSaveKb={onSaveKb} />;

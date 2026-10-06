@@ -27,16 +27,6 @@ describe("drainEdge", () => {
     expect(edge.drainQueue).toBe(false);
   });
 
-  it("does NOT drain when Stop clears a held message before the bind landed", () => {
-    const edge = drainEdge({
-      ...base,
-      prevAcp: undefined,
-      curAcp: undefined,
-      curStatus: "idle",
-    });
-    expect(edge.drainQueue).toBe(false);
-  });
-
   it("drains on the bind landing, even while the status reads running", () => {
     const edge = drainEdge({
       ...base,
@@ -68,5 +58,15 @@ describe("drainEdge", () => {
   it("stays quiet on a status edge that is not a turn end", () => {
     expect(drainEdge({ ...base, prevStatus: "idle", curStatus: "running" }).drainQueue).toBe(false);
     expect(drainEdge({ ...base, prevStatus: null, curStatus: "idle" }).drainQueue).toBe(false);
+  });
+
+  it("releases nothing while the send gate is closed, then everything on its fall", () => {
+    // A bind or a turn's end during a resume, or while a mode the resume could
+    // not restore is unanswered, must not send under the agent's own mode.
+    const held = { ...base, prevResuming: true, curResuming: true };
+    expect(drainEdge({ ...held, prevAcp: undefined }).drainQueue).toBe(false);
+    expect(drainEdge({ ...held, prevAcp: undefined }).justBound).toBe(false);
+    expect(drainEdge(held).turnFinished).toBe(false);
+    expect(drainEdge({ ...base, prevStatus: "idle", prevResuming: true }).justResumed).toBe(true);
   });
 });

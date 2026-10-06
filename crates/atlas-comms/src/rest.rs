@@ -21,6 +21,8 @@ pub struct RestClient {
     http: reqwest::Client,
     base: String,
     tokens: Arc<dyn TokenSource>,
+    /// The last token minted and when; see [`RestClient::token`].
+    cached: std::sync::Mutex<Option<(String, std::time::Instant)>>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -42,6 +44,24 @@ pub struct MessagePage {
     /// refresh.
     #[serde(default)]
     pub reactions: Vec<ReactionRow>,
+}
+
+/// `GET /workspaces`: the Workspaces a message in this organisation may
+/// reference — the ones it owns that are visible to all of it
+/// (`visibility = 'org'`) and not archived. Restricted Workspaces are left out
+/// outright, because the send path refuses a reference to one: this list and
+/// that check are the same query on the server.
+#[derive(Debug, Clone, Deserialize)]
+pub struct WorkspaceList {
+    #[serde(default)]
+    pub workspaces: Vec<WorkspaceName>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct WorkspaceName {
+    /// The Workspace registry id — what a reference's `workspace_ref_id` names.
+    pub id: String,
+    pub name: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -92,13 +112,52 @@ pub struct ConversationPatch {
     pub workspace_ref_ids: Option<Vec<String>>,
 }
 
+/// How long a minted token is reused. Access JWTs live about ten minutes;
+/// reusing one for four leaves a wide margin for clock skew and slow requests
+/// without parsing `exp`.
+const TOKEN_REUSE: std::time::Duration = std::time::Duration::from_secs(240);
+
 impl RestClient {
     pub fn new(base: String, tokens: Arc<dyn TokenSource>) -> Self {
         Self {
             http: reqwest::Client::new(),
             base,
             tokens,
+            cached: std::sync::Mutex::new(None),
         }
+    }
+
+    /// A token for one request, reused across requests rather than minted per
+    /// call — each mint is a `GET /token` against the auth server, which
+    /// rate-limits it, and a busy chat panel alongside a Cloud Timeline was
+    /// enough to exhaust the limit for every other caller too.
+    async fn token(&self) -> Result<String> {
+        {
+            let cached = self
+                .cached
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some((token, minted)) = cached.as_ref() {
+                if minted.elapsed() < TOKEN_REUSE {
+                    return Ok(token.clone());
+                }
+            }
+        }
+        let token = self.tokens.mint().await?;
+        *self
+            .cached
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Some((token.clone(), std::time::Instant::now()));
+        Ok(token)
+    }
+
+    /// Drop the cached token — on a `401`, so a rejected one is never reused.
+    fn forget_token(&self) {
+        *self
+            .cached
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
     }
 
     async fn request(
@@ -108,7 +167,7 @@ impl RestClient {
         org: &str,
         body: Option<serde_json::Value>,
     ) -> Result<reqwest::Response> {
-        let token = self.tokens.mint().await?;
+        let token = self.token().await?;
         let sep = if path.contains('?') { '&' } else { '?' };
         let url = format!("{}{path}{sep}org={org}", self.base);
         let mut req = self
@@ -120,6 +179,9 @@ impl RestClient {
             req = req.json(&json);
         }
         let res = req.send().await?;
+        if res.status() == reqwest::StatusCode::UNAUTHORIZED {
+            self.forget_token();
+        }
         Ok(res)
     }
 
@@ -177,6 +239,12 @@ impl RestClient {
 
     pub async fn conversations(&self, org: &str) -> Result<ConversationList> {
         self.json(reqwest::Method::GET, "/conversations", org, None)
+            .await
+    }
+
+    /// The Workspaces a message may reference ([`WorkspaceList`]).
+    pub async fn workspaces(&self, org: &str) -> Result<WorkspaceList> {
+        self.json(reqwest::Method::GET, "/workspaces", org, None)
             .await
     }
 
@@ -273,7 +341,11 @@ impl RestClient {
 
     /// Not idempotent, and that is the feature: membership is frozen, so
     /// "add somebody" is a *new* group with no history.
-    pub async fn create_group_dm(&self, org: &str, member_ids: Vec<String>) -> Result<Conversation> {
+    pub async fn create_group_dm(
+        &self,
+        org: &str,
+        member_ids: Vec<String>,
+    ) -> Result<Conversation> {
         let body = serde_json::json!({ "kind": "group_dm", "member_ids": member_ids });
         #[derive(Deserialize)]
         struct Wrapper {
@@ -439,12 +511,7 @@ impl RestClient {
     /// Create a draft. Title ≤ 200 chars (`CHAT_DRAFT_TITLE_MAX`) — refused,
     /// not truncated, past that. Deliberately NOT announced by the server, so
     /// the caller prepends the 201 body and everyone else learns by poll.
-    pub async fn create_draft(
-        &self,
-        org: &str,
-        conv_id: &str,
-        title: &str,
-    ) -> Result<PromptDraft> {
+    pub async fn create_draft(&self, org: &str, conv_id: &str, title: &str) -> Result<PromptDraft> {
         #[derive(Deserialize)]
         struct Wrapper {
             draft: PromptDraft,
@@ -680,8 +747,13 @@ impl RestClient {
         on_chunk: &mut (dyn FnMut(u64, u64) + Send),
     ) -> Result<Vec<u8>> {
         let res = Self::check(
-            self.request(reqwest::Method::GET, &format!("/files/{file_id}"), org, None)
-                .await?,
+            self.request(
+                reqwest::Method::GET,
+                &format!("/files/{file_id}"),
+                org,
+                None,
+            )
+            .await?,
         )
         .await?;
         Self::drain(res, on_chunk).await

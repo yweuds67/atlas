@@ -1,7 +1,7 @@
 //! Global tracing subscriber installer.
 //!
 //! Routes `tracing::info!` / `warn!` / `error!` calls from anywhere in the
-//! Rust workspace to stderr AND to a daily-rotated log file. Verbosity is
+//! Rust project to stderr AND to a daily-rotated log file. Verbosity is
 //! controlled by the `RUST_LOG` environment variable; default is
 //! `atlas=info,atlas_acp_thread=info,atlas_agent_servers=info,atlas_agent_store=info,info`.
 //!
@@ -27,9 +27,6 @@ use tracing_subscriber::layer::SubscriberExt as _;
 use tracing_subscriber::util::SubscriberInitExt as _;
 use tracing_subscriber::EnvFilter;
 
-/// Must match `identifier` in `tauri.conf.json`; the subscriber is installed
-/// before a Tauri handle exists, so the path is derived rather than resolved.
-const BUNDLE_ID: &str = "dev.atlas.ide";
 const LOG_FILE_PREFIX: &str = "atlas";
 const MAX_LOG_FILES: usize = 7;
 
@@ -40,17 +37,25 @@ pub fn log_dir() -> Option<PathBuf> {
     LOG_DIR.get().cloned().flatten()
 }
 
+/// The subscriber is installed before a Tauri handle exists, so the path is
+/// derived rather than resolved — from the profile's bundle identifier
+/// (`dev.atlas.ide`, or `dev.atlas.ide.dev` for the dev profile), which is the
+/// `identifier` the app was built with. `run()` fixes the profile before
+/// calling [`init`].
 fn default_log_dir() -> Option<PathBuf> {
+    let bundle_id = atlas_profile::current().identifier();
     if cfg!(target_os = "macos") {
-        dirs::home_dir().map(|home| home.join("Library").join("Logs").join(BUNDLE_ID))
+        dirs::home_dir().map(|home| home.join("Library").join("Logs").join(bundle_id))
     } else {
-        dirs::data_local_dir().map(|dir| dir.join(BUNDLE_ID).join("logs"))
+        dirs::data_local_dir().map(|dir| dir.join(bundle_id).join("logs"))
     }
 }
 
 pub fn init() {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-        EnvFilter::new("atlas=info,atlas_acp_thread=info,atlas_agent_servers=info,atlas_agent_store=info,info")
+        EnvFilter::new(
+            "atlas=info,atlas_acp_thread=info,atlas_agent_servers=info,atlas_agent_store=info,info",
+        )
     });
 
     let stderr_layer = tracing_subscriber::fmt::layer()

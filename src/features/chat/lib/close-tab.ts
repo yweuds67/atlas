@@ -3,8 +3,9 @@ import { useLayoutStore } from "@/features/layout/stores/layout-store";
 import { useTerminalStore } from "@/features/terminal/stores/terminal-store";
 import { useChatStore } from "@/features/chat/stores/chat-store";
 import { agents } from "./agents-api";
+import { clearSessionAttention } from "@/features/notifications/lib/agent-notifier";
 import { isBusyAgentStatus } from "@/types/agent";
-import { useStopAgentsConfirmStore } from "@/features/workspaces/lib/stop-agents-confirm";
+import { useStopAgentsConfirmStore } from "@/features/projects/lib/stop-agents-confirm";
 
 /**
  * Close a tab, with chat-session hygiene. Bare `layout.closeTab` never told the
@@ -16,7 +17,7 @@ import { useStopAgentsConfirmStore } from "@/features/workspaces/lib/stop-agents
  *   (`findTabByAcpSession` returns the first match — the invisible orphan).
  * - IDLE: the backend session actor leaked for the process lifetime.
  *
- * So: a busy chat asks first (same dialog as workspace close) and is cancelled
+ * So: a busy chat asks first (same dialog as project close) and is cancelled
  * on confirm; either way the store session + backend actor are dropped WITH the
  * tab. Non-chat tabs close exactly as before.
  */
@@ -59,6 +60,7 @@ function finishClose(tabId: string): void {
   if (s) {
     if (s.acpSessionId) {
       chat.actions.clearPermissionsForSession(s.acpSessionId);
+      clearSessionAttention(s.acpSessionId);
     }
     chat.actions.removeSession(tabId);
     // The closed chat's live row was the sidebar's only handle on it — re-list

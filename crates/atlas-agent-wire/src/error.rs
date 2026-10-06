@@ -1,10 +1,10 @@
 //! How a failure should be classified — the `turn_failed.error_kind` tokens.
 //!
-//! This lives with the wire because it IS wire: `error_kind` is a frozen field
-//! on `SessionDelta::TurnFailed` (`docs/agents/delta-wire-contract.md`) and the
+//! This lives with the wire because it IS wire: `error_kind` is a field
+//! on `SessionDelta::TurnFailed` (pinned by `tests/contract.rs`) and the
 //! frontend routes on its exact values — `auth` sends the user to sign-in
-//! rather than showing a protocol error. Both ACP stacks classify failures, so
-//! neither can own the taxonomy.
+//! rather than showing a protocol error. The tokens are additive-only: renaming
+//! one silently re-routes failures in the UI.
 //!
 //! Moved verbatim from `atlas-acp/src/error.rs` (the 1.3 stack) at Stage 3 of
 //! the Zed port; the classifier's substring tables are unchanged, because a
@@ -124,7 +124,10 @@ mod tests {
             ("HTTP 503: Service Unavailable", ErrorClass::Transient),
             ("request timed out", ErrorClass::Transient),
             ("error sending request for url", ErrorClass::Transient),
-            ("HTTP 429: x (gave up after 4 attempts)", ErrorClass::Transient),
+            (
+                "HTTP 429: x (gave up after 4 attempts)",
+                ErrorClass::Transient,
+            ),
             ("HTTP 401: authentication_error", ErrorClass::Auth),
             ("HTTP 403: permission_error", ErrorClass::Auth),
             ("invalid x-api-key", ErrorClass::Auth),

@@ -17,7 +17,9 @@
 
 use serde::Serialize;
 
-use crate::wire::{Attachment, Call, CodeRef, Conversation, ReactionRow, ReadState};
+use crate::wire::{
+    Attachment, Call, CodeRef, Conversation, ReactionRow, ReadState, SessionReference,
+};
 
 #[derive(Debug, Clone, Serialize)]
 pub struct CommsEnvelope {
@@ -61,6 +63,9 @@ pub struct WireMessage {
     pub created_at: i64,
     pub attachments: Vec<Attachment>,
     pub code_refs: Vec<CodeRef>,
+    /// Recorded sessions and checkpoints the message points at, drawn as
+    /// reference cards.
+    pub artifact_refs: Vec<SessionReference>,
     pub draft_id: Option<String>,
     pub client_msg_id: Option<String>,
     /// `"sending" | "sent" | "failed"`. Two rungs plus a failure — nothing on
@@ -99,16 +104,22 @@ pub enum CommsEvent {
         discoverable: Vec<Conversation>,
     },
 
-    ReadsChanged { reads: Vec<ReadState> },
+    ReadsChanged {
+        reads: Vec<ReadState>,
+    },
 
     /// One conversation's read state moved. The common case — every
     /// `read.updated` frame names a single conversation — used to ride the
     /// bulk event above, re-serializing the WHOLE read table per read
     /// receipt. Bulk stays for snapshot restatements (clean reconnect).
-    ReadChanged { read: ReadState },
+    ReadChanged {
+        read: ReadState,
+    },
 
     /// The **whole** online set — an assignment, not a delta.
-    Presence { online: Vec<String> },
+    Presence {
+        online: Vec<String>,
+    },
 
     Typing {
         conv_id: String,

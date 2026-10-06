@@ -38,7 +38,7 @@ pub struct RepoMeta {
 }
 
 fn meta_path(project_path: &str) -> std::path::PathBuf {
-    Path::new(project_path).join(".atlas").join("repo-meta.json")
+    atlas_profile::dir_in(Path::new(project_path)).join("repo-meta.json")
 }
 
 fn read_meta(project_path: &str) -> BTreeMap<String, RepoMeta> {
@@ -126,8 +126,7 @@ fn cloned_repo_dir(project_path: &str, repo_name: &str) -> Result<std::path::Pat
     if !safe_segment(repo_name) {
         return Err("invalid repository name".to_string());
     }
-    let dir = Path::new(project_path)
-        .join(".atlas")
+    let dir = atlas_profile::dir_in(Path::new(project_path))
         .join("repos")
         .join(repo_name);
     if !dir.join(".git").exists() {
@@ -176,10 +175,7 @@ fn derive_display_name(repo_dir: &Path, dir_name: &str) -> String {
         {
             // Normalise `git@host:owner/repo.git` and `https://host/owner/repo.git`
             // down to `owner/repo`.
-            let tail = url
-                .rsplit(['/', ':'])
-                .take(2)
-                .collect::<Vec<_>>();
+            let tail = url.rsplit(['/', ':']).take(2).collect::<Vec<_>>();
             if tail.len() == 2 {
                 let repo = tail[0].trim_end_matches(".git");
                 let owner = tail[1];
@@ -211,27 +207,71 @@ pub async fn search_github(query: String) -> Result<Vec<GithubRepo>, String> {
         .build()
         .unwrap_or_default();
 
-    let resp = client.get(&url).send().await
+    let resp = client
+        .get(&url)
+        .send()
+        .await
         .map_err(|e| format!("GitHub API request failed: {e}"))?;
 
-    let json: serde_json::Value = resp.json().await
+    let json: serde_json::Value = resp
+        .json()
+        .await
         .map_err(|e| format!("Failed to parse response: {e}"))?;
 
-    let items = json.get("items").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+    let items = json
+        .get("items")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
 
-    let repos = items.iter().map(|item| {
-        GithubRepo {
-            name: item.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-            full_name: item.get("full_name").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-            description: item.get("description").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-            html_url: item.get("html_url").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-            clone_url: item.get("clone_url").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-            language: item.get("language").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-            stars: item.get("stargazers_count").and_then(serde_json::Value::as_u64).unwrap_or(0) as u32,
-            forks: item.get("forks_count").and_then(serde_json::Value::as_u64).unwrap_or(0) as u32,
-            updated_at: item.get("updated_at").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-        }
-    }).collect();
+    let repos = items
+        .iter()
+        .map(|item| GithubRepo {
+            name: item
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+            full_name: item
+                .get("full_name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+            description: item
+                .get("description")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+            html_url: item
+                .get("html_url")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+            clone_url: item
+                .get("clone_url")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+            language: item
+                .get("language")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+            stars: item
+                .get("stargazers_count")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0) as u32,
+            forks: item
+                .get("forks_count")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0) as u32,
+            updated_at: item
+                .get("updated_at")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+        })
+        .collect();
 
     Ok(repos)
 }
@@ -263,10 +303,7 @@ fn parse_github_https(clone_url: &str) -> Result<(String, String), String> {
         .ok_or_else(|| "only https://github.com/<owner>/<repo> URLs can be cloned".to_string())?;
     let mut parts = rest.trim_end_matches('/').splitn(2, '/');
     let owner = parts.next().unwrap_or_default();
-    let repo = parts
-        .next()
-        .unwrap_or_default()
-        .trim_end_matches(".git");
+    let repo = parts.next().unwrap_or_default().trim_end_matches(".git");
     if !safe_segment(owner) || !safe_segment(repo) || repo.contains('/') {
         return Err("that does not look like a GitHub repository URL".to_string());
     }
@@ -288,7 +325,7 @@ pub async fn clone_github_repo(
         return Err("invalid repository name".to_string());
     }
 
-    let repos_dir = Path::new(&project_path).join(".atlas").join("repos");
+    let repos_dir = atlas_profile::dir_in(Path::new(&project_path)).join("repos");
     fs::create_dir_all(&repos_dir).map_err(|e| e.to_string())?;
 
     let dest = repos_dir.join(&repo_name);
@@ -320,7 +357,9 @@ pub async fn clone_github_repo(
             write_meta(&project_path, &repo_name, &meta)?;
         }
         Ok(dest_str)
-    }).await.map_err(|e| e.to_string())?
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 // All async + spawn_blocking — see the comment in knowledge.rs for the
@@ -328,7 +367,7 @@ pub async fn clone_github_repo(
 #[tauri::command]
 pub async fn list_cloned_repos(project_path: String) -> Result<Vec<ClonedRepo>, String> {
     tokio::task::spawn_blocking(move || {
-        let repos_dir = Path::new(&project_path).join(".atlas").join("repos");
+        let repos_dir = atlas_profile::dir_in(Path::new(&project_path)).join("repos");
         if !repos_dir.exists() {
             return Ok(vec![]);
         }
@@ -351,8 +390,7 @@ pub async fn list_cloned_repos(project_path: String) -> Result<Vec<ClonedRepo>, 
             if !path.join(".git").exists() {
                 continue;
             }
-            let has_readme =
-                path.join("README.md").exists() || path.join("readme.md").exists();
+            let has_readme = path.join("README.md").exists() || path.join("readme.md").exists();
             let display_name = derive_display_name(&path, &name);
             let branch = read_head_branch(&path);
             let meta = metas.get(&name).cloned();
@@ -373,16 +411,12 @@ pub async fn list_cloned_repos(project_path: String) -> Result<Vec<ClonedRepo>, 
 }
 
 #[tauri::command]
-pub async fn read_repo_readme(
-    project_path: String,
-    repo_name: String,
-) -> Result<String, String> {
+pub async fn read_repo_readme(project_path: String, repo_name: String) -> Result<String, String> {
     if !safe_segment(&repo_name) {
         return Err("invalid repository name".to_string());
     }
     tokio::task::spawn_blocking(move || {
-        let repo_dir = Path::new(&project_path)
-            .join(".atlas")
+        let repo_dir = atlas_profile::dir_in(Path::new(&project_path))
             .join("repos")
             .join(&repo_name);
         for name in &[
@@ -405,18 +439,14 @@ pub async fn read_repo_readme(
 }
 
 #[tauri::command]
-pub async fn delete_cloned_repo(
-    project_path: String,
-    repo_name: String,
-) -> Result<(), String> {
+pub async fn delete_cloned_repo(project_path: String, repo_name: String) -> Result<(), String> {
     // `remove_dir_all` steered by the renderer: the name MUST be a plain
     // segment or this deletes wherever `../..` points.
     if !safe_segment(&repo_name) {
         return Err("invalid repository name".to_string());
     }
     tokio::task::spawn_blocking(move || {
-        let repo_dir = Path::new(&project_path)
-            .join(".atlas")
+        let repo_dir = atlas_profile::dir_in(Path::new(&project_path))
             .join("repos")
             .join(&repo_name);
         if repo_dir.exists() {
@@ -470,7 +500,15 @@ pub async fn switch_cloned_repo_branch(
     tokio::task::spawn_blocking(move || {
         git_in(
             &repo_dir,
-            &["fetch", "--depth", "1", "--no-tags", "--", "origin", &branch],
+            &[
+                "fetch",
+                "--depth",
+                "1",
+                "--no-tags",
+                "--",
+                "origin",
+                &branch,
+            ],
         )?;
         // `-B` rather than `-b`: switching back to a branch visited before
         // must re-point it at what was just fetched, not fail on "exists".
@@ -498,7 +536,15 @@ pub async fn update_cloned_repo(project_path: String, repo_name: String) -> Resu
     tokio::task::spawn_blocking(move || {
         git_in(
             &repo_dir,
-            &["fetch", "--depth", "1", "--no-tags", "--", "origin", &branch],
+            &[
+                "fetch",
+                "--depth",
+                "1",
+                "--no-tags",
+                "--",
+                "origin",
+                &branch,
+            ],
         )?;
         git_in(&repo_dir, &["reset", "--hard", "FETCH_HEAD"])?;
         Ok(branch)
@@ -538,12 +584,23 @@ pub async fn fetch_cloned_repo_meta(
         return Err(format!("GitHub answered {}", resp.status()));
     }
     let item: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
-    let str_of = |k: &str| item.get(k).and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let str_of = |k: &str| {
+        item.get(k)
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string()
+    };
     let meta = RepoMeta {
         description: str_of("description"),
         language: str_of("language"),
-        stars: item.get("stargazers_count").and_then(serde_json::Value::as_u64).unwrap_or(0) as u32,
-        forks: item.get("forks_count").and_then(serde_json::Value::as_u64).unwrap_or(0) as u32,
+        stars: item
+            .get("stargazers_count")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0) as u32,
+        forks: item
+            .get("forks_count")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0) as u32,
         html_url: str_of("html_url"),
         updated_at: str_of("updated_at"),
     };
@@ -555,7 +612,10 @@ pub async fn fetch_cloned_repo_meta(
 }
 
 fn urlencoded(s: &str) -> String {
-    s.replace(' ', "+").replace('&', "%26").replace('=', "%3D").replace('?', "%3F")
+    s.replace(' ', "+")
+        .replace('&', "%26")
+        .replace('=', "%3D")
+        .replace('?', "%3F")
 }
 
 #[cfg(test)]
@@ -593,13 +653,19 @@ mod clone_guard_tests {
 
     #[test]
     fn head_names_the_branch_or_nothing() {
-        assert_eq!(branch_from_head("ref: refs/heads/main\n"), Some("main".into()));
+        assert_eq!(
+            branch_from_head("ref: refs/heads/main\n"),
+            Some("main".into())
+        );
         assert_eq!(
             branch_from_head("ref: refs/heads/feature/x"),
             Some("feature/x".into())
         );
         // Detached HEAD is a bare sha.
-        assert_eq!(branch_from_head("0123456789abcdef0123456789abcdef01234567\n"), None);
+        assert_eq!(
+            branch_from_head("0123456789abcdef0123456789abcdef01234567\n"),
+            None
+        );
         assert_eq!(branch_from_head("ref: refs/heads/"), None);
     }
 

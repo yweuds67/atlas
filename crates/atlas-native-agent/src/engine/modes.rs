@@ -3,7 +3,7 @@
 //! The modes are Atlas's, not the engine's, and the vocabulary is fixed by what
 //! the mode picker already shows — this is a translation, not a redesign
 //! (design-language invariant). The four ids also have to keep matching the
-//! Cersei path's, because the picker is shared and a mode set on one engine has
+//! previous native path's, because the picker is shared and a mode set on one engine has
 //! to mean the same thing on the other.
 //!
 //! The engine expresses permission as two orthogonal things, and both are
@@ -16,11 +16,11 @@
 //! first", and approval alone cannot stop a command that never asks.
 
 use agent_client_protocol::schema::v1 as acp;
-// The app-server protocol's own copies, not `codex_protocol`'s. They mirror
+// The app-server protocol's own copies, not `atlas_engine_protocol`'s. They mirror
 // each other, but `thread/settings/update` takes these, and converting at the
 // call site would only add a layer that can be got wrong.
-use codex_app_server_protocol::AskForApproval;
-use codex_app_server_protocol::SandboxPolicy;
+use atlas_engine_app_server_protocol::AskForApproval;
+use atlas_engine_app_server_protocol::SandboxPolicy;
 
 /// One of Atlas's modes, in the shape the picker renders.
 pub struct AtlasMode {
@@ -31,7 +31,7 @@ pub struct AtlasMode {
 
 /// The four modes, in picker order.
 ///
-/// Ids, names and descriptions are copied from the Cersei path verbatim. A
+/// Ids, names and descriptions are copied from the previous native path verbatim. A
 /// difference here would show as the picker changing when the switch flips,
 /// which is exactly what "the app cannot tell the engine changed" forbids.
 pub const MODES: [AtlasMode; 4] = [
@@ -61,8 +61,8 @@ pub const DEFAULT_MODE_ID: &str = "default";
 
 /// Normalises a mode id, tolerating another agent's vocabulary.
 ///
-/// Same reason the Cersei path does it: a picker seeded with cross-agent ids
-/// can hand us Claude's `bypassPermissions` or Codex's `danger-full-access`.
+/// Same reason the previous native path does it: a picker seeded with cross-agent ids
+/// can hand us Claude's `bypassPermissions` or the engine's `danger-full-access`.
 /// Matching exactly meant "Bypass" silently fell through to prompting on every
 /// action — a mode that looks set and does nothing.
 fn normalise(mode: &str) -> &'static str {
@@ -140,7 +140,7 @@ mod tests {
     }
 
     #[test]
-    fn the_picker_offers_exactly_the_four_modes_the_cersei_path_does() {
+    fn the_picker_offers_exactly_the_four_modes_the_native_path_does() {
         // The picker is shared. A fifth mode, a missing one, or a renamed one
         // would show as the UI changing when the switch flips.
         let ids: Vec<_> = MODES.iter().map(|m| m.id).collect();
@@ -154,7 +154,10 @@ mod tests {
         // Read-only alone would leave the engine offering to escalate out of
         // plan mode, which turns a read-only mode into a nagging one.
         let (approval, sandbox) = engine_policy("plan");
-        assert!(is_read_only(&sandbox), "plan mode must not be able to write");
+        assert!(
+            is_read_only(&sandbox),
+            "plan mode must not be able to write"
+        );
         assert!(matches!(approval, AskForApproval::Never));
     }
 
@@ -194,7 +197,12 @@ mod tests {
         // The bug this reproduces: matching ids exactly meant "Bypass" arriving
         // as `bypassPermissions` fell through to the default and silently
         // prompted on every action — a mode that looks set and does nothing.
-        for alias in ["bypassPermissions", "danger-full-access", "YOLO", "full_access"] {
+        for alias in [
+            "bypassPermissions",
+            "danger-full-access",
+            "YOLO",
+            "full_access",
+        ] {
             let (approval, sandbox) = engine_policy(alias);
             assert!(
                 matches!(sandbox, SandboxPolicy::DangerFullAccess)
@@ -203,7 +211,10 @@ mod tests {
             );
         }
         for alias in ["read-only", "planMode", "PLAN"] {
-            assert!(is_read_only(&engine_policy(alias).1), "{alias} should be plan");
+            assert!(
+                is_read_only(&engine_policy(alias).1),
+                "{alias} should be plan"
+            );
         }
         for alias in ["auto_edits", "AutoEdit", "accept"] {
             assert!(

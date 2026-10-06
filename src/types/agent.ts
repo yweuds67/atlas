@@ -3,11 +3,17 @@ import type { MentionData } from "@/features/chat/lib/mentions";
 
 /** The agents Atlas has first-party BRANDING for — labels, brand icons and
  *  `.agent-*` CSS tokens, which are Atlas's own design rather than registry
- *  metadata. It is not a list of agents that exist: apart from `cersei` (the
+ *  metadata. It is not a list of agents that exist: apart from `atlas-agent` (the
  *  native agent) every one of these must be installed from the Marketplace
  *  before it can run (ADR-0002), and an installed agent with no entry here
  *  simply renders from its registry metadata. */
-export type FirstPartyAgent = "claude-code" | "codex" | "opencode" | "cursor" | "kilo" | "cersei";
+export type FirstPartyAgent =
+  | "claude-code"
+  | "codex"
+  | "opencode"
+  | "cursor"
+  | "kilo"
+  | "atlas-agent";
 
 /** Agent identity is plugin-id-first and OPEN (Paseo-style): the first-party
  *  literals keep autocomplete/narrowing, but any registry-installed plugin id
@@ -27,7 +33,7 @@ export type SwitchableAgent = FirstPartyAgent | (string & {});
  *  This is NOT a default ACP agent and must never be used as a stand-in for
  *  one; it is the identity of "Atlas itself". The switchable list is otherwise
  *  entirely catalog-derived — see `switchableAgentIds()` in features/agents. */
-export const NATIVE_AGENT_ID = "cersei";
+export const NATIVE_AGENT_ID = "atlas-agent";
 
 /** Upstream 0.3.0-x's name for the same constant — its identity model calls
  *  the native agent `NATIVE_AGENT` and files merged from that line import it
@@ -42,10 +48,9 @@ export const AGENT_LABEL: Record<FirstPartyAgent, string> = {
   opencode: "OpenCode",
   cursor: "Cursor",
   kilo: "Kilo",
-  // The key is the stored agent id, which stays `cersei` forever because every
-  // recorded thread resolves through it (D7). The label is the product name.
-  // They are deliberately different things.
-  cersei: "Atlas Agent",
+  // The key is the stored agent id (`NATIVE_AGENT_ID`); every recorded thread
+  // resolves through it. The label is the product name. Keep them separate.
+  "atlas-agent": "Atlas Agent",
 };
 
 /** The Rust-side spawnable plugin id for each first-party agent (see
@@ -57,7 +62,7 @@ export const PLUGIN_ID_BY_AGENT: Record<FirstPartyAgent, string> = {
   opencode: "opencode",
   cursor: "cursor",
   kilo: "kilo",
-  cersei: "cersei",
+  "atlas-agent": "atlas-agent",
 };
 
 function isFirstPartyAgent(agentType: string): agentType is FirstPartyAgent {
@@ -88,7 +93,7 @@ export function agentTypeFromPluginId(pluginId: string): AgentType {
   if (pluginId === "opencode") return "opencode";
   if (pluginId === "cursor") return "cursor";
   if (pluginId === "kilo") return "kilo";
-  if (pluginId === "cersei") return "cersei";
+  if (pluginId === "atlas-agent") return "atlas-agent";
   // The NATIVE claude ids only — the current spec id and the legacy one old
   // history rows recorded. A `startsWith("claude")` here also swallowed the
   // EXTERNAL registry agent "claude-acp", whose identity is its plugin id:
@@ -146,6 +151,10 @@ export const CLAUDE_PERMISSION_MODES: ClaudePermissionMode[] = [
   "auto",
 ];
 
+export function isClaudePermissionMode(id: string | null | undefined): id is ClaudePermissionMode {
+  return !!id && (CLAUDE_PERMISSION_MODES as readonly string[]).includes(id);
+}
+
 export const CLAUDE_PERMISSION_MODE_LABEL: Record<ClaudePermissionMode, string> = {
   default: "Default",
   acceptEdits: "Accept Edits",
@@ -184,6 +193,10 @@ export interface ChatSession {
    *  affordance) respawns the agent and load_session-resumes where the
    *  transcript kind supports it. Never auto-restarted silently. */
   disconnected?: boolean;
+  /** Set with `disconnected` when the process went away because its agent
+   *  was updated (`noteAgentUpdated`): the version it restarts on. The banner
+   *  says "updated" rather than "exited". Cleared with `disconnected`. */
+  updatedTo?: string;
   /** Why the last bind for this tab gave up, when it did so without a
    *  session (`failPendingBinds`): the manager's reason for the lost
    *  connection. Shown beside the Restart affordance; cleared on (re)bind. */
@@ -207,7 +220,7 @@ export interface ChatSession {
    *  Rust `turn_seq` on status/terminal deltas. Used to reject a stale terminal
    *  (idle/error) belonging to a turn already superseded by a newer send —
    *  the guard against premature "done" under parallel / queued / wake timing.
-   *  Absent (or 0) for the native cersei agent, which is treated as current. */
+   *  Absent (or 0) for the native agent, which is treated as current. */
   currentTurnSeq?: number;
   /** The current turn's live plan (ACP `plan` / TodoWrite), mirrored here from
    *  the trailing assistant message so the docked plan panel above the composer
@@ -248,6 +261,13 @@ export interface ChatSession {
   acpCurrentMode?: string;
   /** True only after the user explicitly changes an ACP mode in this tab. */
   acpModeExplicit?: boolean;
+  /**
+   * The mode id a resume could not put this session in (see `resume-mode.ts`):
+   * the agent refused it, or no longer offers it, so the session runs in the
+   * agent's own mode. While set, `ModeRestoreBar` shows it and sending is held
+   * until the user picks a mode; the next resume of this tab asks for it again.
+   */
+  unrestoredModeId?: string;
   /** Modes the agent advertised for this session — drives the composer's mode
    *  picker for non-Claude agents (e.g. Codex). Seeded from the snapshot. */
   acpAvailableModes?: SessionModeInfo[];
@@ -257,8 +277,8 @@ export interface ChatSession {
    *  per-agent modes cache so switching feels instant. Cleared by `setAcpModes`. */
   acpModesPending?: boolean;
   /** Currently selected ACP model id (default / sonnet / haiku / …). For the
-   *  native Cersei agent this is the bare model id; the provider lives in
-   *  `cerseiProvider` and the two are pushed to the backend as `provider/model`. */
+   *  native agent this is the bare model id; the provider lives in
+   *  `nativeProvider` and the two are pushed to the backend as `provider/model`. */
   acpCurrentModel?: string;
   /** Raw ACP `configOptions` for this session (P2.2). Kept current by the
    *  `config_options_updated` delta so a knob toggled INSIDE the agent is
@@ -277,9 +297,9 @@ export interface ChatSession {
    *  composer's model picker. Seeded from the snapshot's `available_models`;
    *  empty for agents (or the native one) that don't expose ACP model lists. */
   acpAvailableModels?: SessionModeInfo[];
-  /** BYOK provider id backing the native Cersei agent's model selection
+  /** BYOK provider id backing the native agent's model selection
    *  (e.g. "anthropic", "openai"). Unused by the ACP agents. */
-  cerseiProvider?: string;
+  nativeProvider?: string;
   /** Cumulative token split for the session, from `usage_updated` deltas.
    *  The native engine reports it as a running total; an ACP agent's
    *  end-of-turn usage is folded into the same counters in Rust. Drives the
@@ -288,7 +308,7 @@ export interface ChatSession {
   /** Latest ACP context-window gauge (Claude Code / Codex) from `context_usage`
    *  deltas — `used`/`size` tokens + cost. Snapshotted onto the trailing
    *  assistant message at turn end (ACP agents have no per-turn in/out split). */
-  contextUsage?: { used: number; size: number; cost: number };
+  contextUsage?: { used: number; size: number; cost: number; currency?: string | null };
   /** True while the native agent is compacting its context window. */
   compacting?: boolean;
   /** The account quota the native engine reports (`rate_limits` deltas).
@@ -300,9 +320,9 @@ export interface ChatSession {
   };
   /** Reasoning-effort level for the native agent ("" / low / medium / high /
    *  max). Only meaningful for Anthropic models (maps to a thinking budget). */
-  cerseiEffort?: string;
+  nativeEffort?: string;
   /** RTK tool-output compression for the native agent (default on). */
-  cerseiCompress?: boolean;
+  nativeCompress?: boolean;
   /** Cumulative usage snapshot at the end of the previous turn — used to derive
    *  per-turn usage for the message footer. */
   lastUsageSnapshot?: { input: number; output: number; cost: number };
@@ -405,16 +425,21 @@ export interface ChatMessage {
    *  assistant message at turn end. These agents can't report a per-turn
    *  input/output split, so the card shows this `used`/`size` context gauge in
    *  the same slot the native agent uses for `usage`. */
-  contextUsage?: { used: number; size: number; cost: number };
+  contextUsage?: { used: number; size: number; cost: number; currency?: string | null };
   /** Adaptive per-turn footer, frozen onto the trailing assistant message at
    *  turn_finished (mirrors `usage` — never set mid-stream). Drives the
    *  TurnSummaryCard's files-read/modified accordion + action buttons. */
   turnSummary?: {
     turnSeq: number;
     files: TurnFile[];
-    /** Whether the workspace was a git repo when the turn ended (gates commit). */
+    /** Whether the project was a git repo when the turn ended (gates commit). */
     repoAtTurn: boolean;
   };
+  /** Wall time of the turn this message ends, in ms: from the user's message to
+   *  turn_finished. Stamped live on the trailing assistant message and NOT
+   *  persisted — replayed timestamps are the load time, not the send time, so a
+   *  restored turn has no honest duration to rebuild and renders without one. */
+  workedMs?: number;
   /** Agent-suggested next steps for this turn's footer. Generated once at
    *  turn end (parse-first, optional BYOK). `turnSeq` guards against a stale
    *  async result landing after a newer turn started. */
@@ -453,6 +478,20 @@ export interface ToolCallDisplay {
   result: string | null;
   status: "pending" | "running" | "completed" | "failed";
   duration: number | null;
+  /**
+   * Epoch ms this call was FIRST SEEN by the store, stamped client-side.
+   *
+   * Not a wire field: the session-delta wire carries no start
+   * time today (an additive field would be the way to add one; `duration` is only ever `null` — see `toChatToolCall`). A `tool_call`
+   * delta is pushed the moment the agent announces the call, so first-sight is
+   * the start to within one IPC hop, which is what the live elapsed figure on a
+   * running block needs and all it needs.
+   *
+   * Absent on calls restored from a transcript snapshot — a reloaded thread has
+   * no live clock to run, and inventing one would date every historical call to
+   * the moment the tab opened.
+   */
+  startedAt?: number;
   /**
    * Structural content the agent attached to this call. Absent for almost every
    * call — only ACP agents that report edits as `ToolCallContent::Diff` (rather

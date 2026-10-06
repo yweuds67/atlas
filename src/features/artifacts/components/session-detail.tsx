@@ -1,14 +1,16 @@
 import {
+  createContext,
   memo,
   useCallback,
   useDeferredValue,
   useEffect,
   useMemo,
   useRef,
+  useContext,
   useState,
   type ReactNode,
 } from "react";
-import * as Popover from "@radix-ui/react-popover";
+import { Popover } from "@base-ui/react/popover";
 import { invoke } from "@tauri-apps/api/core";
 import {
   Brain,
@@ -16,6 +18,7 @@ import {
   ChevronDown,
   ChevronRight,
   ChevronsDown,
+  MessageSquare,
   Filter,
   Download,
   GitCommitHorizontal,
@@ -28,6 +31,7 @@ import {
 } from "lucide-react";
 
 import { AtlasIcon } from "@/components/atlas-icon";
+import { ActionCluster } from "./action-cluster";
 import { extractInjectedContext, type InjectedBlock } from "@/features/chat/lib/atlas-context";
 import { CachedMarkdown } from "@/lib/markdown-cache";
 import { fmtCost } from "@/features/monitor/lib/usage-format";
@@ -39,6 +43,8 @@ import {
   type TokenSpend,
 } from "@/features/settings/stores/model-pricing-store";
 import { cn } from "@/lib/utils";
+import { Hint } from "@/ui/tooltip";
+import { HintGroup, HintItem } from "@/ui/hint-group";
 
 import {
   DEFAULT_FILTERS,
@@ -58,7 +64,16 @@ import {
 import { observeSize } from "../lib/shared-resize-observer";
 import { animatedScrollTo } from "../lib/scroll-to";
 import { useTimelineScroll } from "../lib/use-timeline-scroll";
+import { commentActivity } from "../lib/comment-activity";
+import { toolLine } from "../lib/tool-line";
+import { ToolGlyph } from "@/features/chat/components/tool-glyph";
+import { anchorKindFor, visibleCount, type Comment } from "../lib/comments-api";
 import { CodeBlock, CopyButton, prettyJson } from "./code-block";
+import { AccountAvatar } from "@/features/auth/components/account-avatar";
+import type { OrgDirectory } from "@/features/organisations/lib/use-org-directory";
+
+import { avatarUser, CommentButton, type CommentActions } from "./comment-thread";
+import { filterKeyForKind } from "../lib/comment-threads";
 import { JUMP_EVENT, type JumpDetail } from "./session-chat-message";
 import { AgentGlyph } from "./agent-glyph";
 
@@ -109,23 +124,80 @@ const NODE_CENTRE = 16;
  */
 const MEASURE = "mx-auto w-full max-w-[920px] px-14";
 
+/**
+ * Everything the comment surfaces need, or `null` on a Session that is not
+ * shared with an Organisation.
+ *
+ * One object rather than five props, because it is all-or-nothing: without a
+ * cloud Project there is no anchor to attach a comment to, so every part of it
+ * is absent together.
+ */
+export interface RowComments {
+  /** Entry `rowId` → its thread. The id is the local one, pushed verbatim. */
+  byAnchor: Record<string, Comment[]>;
+  /** Comments on the Session itself, shown from the masthead. */
+  session: Comment[];
+  actions: CommentActions;
+  /**
+   * The Organisation's roster, for names and faces.
+   *
+   * Passed down rather than looked up per comment: one hook at the pane, and
+   * every byline, mention and avatar stack below resolves against the same map.
+   * It also carries `currentUserId`, which is what decides whose comments get a
+   * delete affordance.
+   */
+  directory: OrgDirectory;
+}
+
 interface Props {
   detail: Detail;
   /** Needed to fetch spilled payloads via `artifacts_payload`. */
   projectPath: string;
+  /** `null` when the Session is local-only. */
+  comments?: RowComments | null;
+  /** The masthead is painted from the board row and the timeline is still on
+   *  its way. Without it an empty `entries` reads as "nothing was recorded". */
+  entriesPending?: boolean;
+  /** Set only for a Session with no local copy — see [`RemoteSourceContext`]. */
+  remote?: RemoteSource | null;
   /** Opened from a commit: land on that Checkpoint rather than at the top. */
   focusCommitSha?: string;
   /** Whether the grounded chat occupies the other half of the split. */
   chatOpen?: boolean;
   onToggleChat?: () => void;
+  /** Whether the comments panel does. The two share one slot. */
+  commentsOpen?: boolean;
+  onToggleComments?: () => void;
 }
+
+/**
+ * Where an oversized payload comes from, when it is not on this disk.
+ *
+ * A **context** rather than another prop because the components that expand a
+ * payload — a response body, a tool call's arguments, its result — sit three
+ * and four levels below the pane, behind `Calls` and `CallTable` and `CallRow`,
+ * none of which have any other reason to know about it. Threading it would put
+ * a prop nobody reads through every one of them.
+ */
+export interface RemoteSource {
+  /** The server Project id. */
+  projectId: string;
+  sessionId: string;
+}
+
+const RemoteSourceContext = createContext<RemoteSource | null>(null);
 
 export function SessionDetail({
   detail,
   projectPath,
+  comments = null,
+  entriesPending = false,
+  remote = null,
   focusCommitSha,
   chatOpen,
   onToggleChat,
+  commentsOpen,
+  onToggleComments,
 }: Props) {
   const [filters, setFilters] = useState<TimelineFilters>(DEFAULT_FILTERS);
   /** Narrow tool calls to failed ones — the "which calls failed" question. */
@@ -171,6 +243,20 @@ export function SessionDetail({
   const contentRef = useRef<HTMLDivElement | null>(null);
 
   const s = detail.summary;
+
+  /**
+   * How many comments the Session carries — the dock's badge.
+   *
+   * Comments, not commented nodes: two people each opening a thread on the
+   * same response are two comments, and a reply is one more. The badge says
+   * how much has been said; the panel's rows say where.
+   */
+  const commentCount = useMemo(() => {
+    if (!comments) return 0;
+    let n = visibleCount(comments.session);
+    for (const rowId in comments.byAnchor) n += visibleCount(comments.byAnchor[rowId]);
+    return n;
+  }, [comments]);
 
   /**
    * Entries with identity carried across detail re-reads.
@@ -369,14 +455,43 @@ export function SessionDetail({
     if (!pendingJump) return;
     const index = groups.findIndex((g) => g.entries.some((e) => e.id === pendingJump));
     if (index === -1) {
-      setFilters((current) => (current.checkpoints ? current : { ...current, checkpoints: true }));
+      // Reveal whatever kind the TARGET is, not Checkpoints.
+      //
+      // This used to unconditionally enable `checkpoints`, which worked only
+      // because the sole jump sources were Checkpoints and chat citations. The
+      // comments panel can address any node, and `thinking` is off by default —
+      // so a comment on a thinking entry set `pendingJump`, found no index,
+      // wrote the same filter state back, and stalled silently with no retry
+      // and no error. A dead click, permanently.
+      const target = detail.entries.find((e) => e.id === pendingJump);
+      if (!target) {
+        setPendingJump(null);
+        return;
+      }
+      const key = filterKeyForKind(target.kind);
+      // The narrowing filters hide entries too, and clearing them is the only
+      // way a jump into a filtered-out tool call or a searched-away row lands.
+      setFailedOnly(false);
+      setTools((current) => (current.size === 0 ? current : new Set()));
+      setSearch("");
+      // `foldRuns` drops all but the last of a consecutive response run, so a
+      // comment on a folded-away response is missing from `groups` even with
+      // every filter on. Clearing all five is what guarantees this effect
+      // terminates instead of re-running against an unchanged state.
+      setFoldResponses(false);
+      setFilters((current) => (current[key] ? current : { ...current, [key]: true }));
       return;
     }
     if (index >= renderCount) {
       setRenderCount(index + 40);
       return;
     }
-    const node = entryRefs.current.get(pendingJump);
+    // Only a group's HEAD is registered — a run of tool calls is one row on
+    // the rail — so the scroll target is that head, never the entry itself. A
+    // comment on the fourth call of a run used to look up its own id here,
+    // find nothing, and leave `pendingJump` set: a click that did nothing, for
+    // good.
+    const node = entryRefs.current.get(groups[index].entries[0].id);
     if (node) {
       jumpTo(node, "center");
       // A smooth scroll into the middle of a long conversation leaves no clue
@@ -446,153 +561,181 @@ export function SessionDetail({
     tools.size;
 
   return (
-    <div className="relative flex h-full min-h-0">
-      <div
-        ref={scrollRef}
-        onScroll={onScroll}
-        className="hide-scrollbar min-h-0 flex-1 overflow-y-auto"
-      >
-        <div ref={contentRef} className={cn(MEASURE, "pb-28 pt-14")}>
-          <Masthead detail={detail} />
+    <RemoteSourceContext.Provider value={remote}>
+      <div className="relative flex h-full min-h-0">
+        <div
+          ref={scrollRef}
+          onScroll={onScroll}
+          className="hide-scrollbar min-h-0 flex-1 overflow-y-auto"
+        >
+          <div ref={contentRef} className={cn(MEASURE, "pb-28 pt-14")}>
+            <Masthead detail={detail} comments={comments} />
 
-          {groups.length === 0 ? (
-            <Empty detail={detail} failedOnly={failedOnly} failedCount={failedCount} />
-          ) : (
-            <div className="mt-14">
-              <Timeline
-                groups={rendered}
-                projectPath={projectPath}
-                agent={s.agent}
-                expandTools={expandTools}
-                landed={landed}
-                register={register}
+            {groups.length === 0 ? (
+              <Empty
+                detail={detail}
+                pending={entriesPending}
+                failedOnly={failedOnly}
+                failedCount={failedCount}
               />
-              {renderCount < groups.length && (
-                <p className="py-6 text-center font-mono text-[11px] text-[var(--text-tertiary)]">
-                  {groups.length - renderCount} more…
-                </p>
+            ) : (
+              <div className="mt-14">
+                <Timeline
+                  groups={rendered}
+                  projectPath={projectPath}
+                  agent={s.agent}
+                  expandTools={expandTools}
+                  landed={landed}
+                  register={register}
+                  comments={comments}
+                />
+                {renderCount < groups.length && (
+                  <p className="py-6 text-center font-mono text-xs text-[var(--muted-foreground)]">
+                    {groups.length - renderCount} more…
+                  </p>
+                )}
+              </div>
+            )}
+          </div>
+        </div>
+
+        {/* Bottom fade — the cue for content below the fold, without the agent
+         *  chat's scroll-to-bottom button: a Session is read top-down and the
+         *  newest entry is not the destination.
+         *
+         *  Deeper than the chat's, and fully opaque before the controls rather
+         *  than at the very bottom edge: the action bar and the search field float
+         *  *on* this, and a linear ramp to the edge left body text legible
+         *  straight through both of them. */}
+        <div
+          aria-hidden
+          className={cn(
+            "pointer-events-none absolute inset-x-0 bottom-0 z-20 h-32 transition-opacity duration-200",
+            more ? "opacity-100" : "opacity-0",
+          )}
+          style={{
+            background:
+              "linear-gradient(to bottom, transparent 0%, color-mix(in srgb, var(--background) 60%, transparent) 28%, color-mix(in srgb, var(--background) 92%, transparent) 44%, var(--background) 55%)",
+          }}
+        />
+
+        {/* The action bar. Floating over the fade rather than docked below the
+         *  scroller: the measure is centred and a full-width toolbar would put its
+         *  controls further from the text than the text is wide. Left is what
+         *  changes the view, right is what moves through it. */}
+        <HintGroup side="top">
+          <div className="pointer-events-none absolute inset-x-0 bottom-0 z-30 flex items-center gap-3 px-4 pb-3.5">
+            <BarButton
+              label="Filters"
+              active={filtersOpen || activeFilters > 0}
+              badge={activeFilters > 0 ? activeFilters : undefined}
+              onClick={() => setFiltersOpen((v) => !v)}
+            >
+              <Filter size={14} strokeWidth={1.6} />
+            </BarButton>
+
+            {/* The search field, between the two control clusters and centred in the
+             *  measure. Same pill as the memory Timeline's: floating, blurred, no
+             *  box around it — it belongs to the content, not to a toolbar. */}
+            <div className="pointer-events-auto mx-auto flex h-11 min-w-0 max-w-[620px] flex-1 items-center gap-2.5 rounded-full border border-[var(--border)] bg-[var(--card)]/70 px-4 shadow-md backdrop-blur-2xl">
+              <Search size={15} className="shrink-0 text-[var(--muted-foreground)]" />
+              <input
+                value={search}
+                onChange={(e) => setSearch(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Escape") setSearch("");
+                }}
+                placeholder="Search this session…"
+                spellCheck={false}
+                aria-label="Search this session"
+                className="min-w-0 flex-1 border-0 bg-transparent p-0 text-base text-[var(--foreground)] outline-none placeholder:text-[var(--muted-foreground)]"
+              />
+              {search && (
+                <>
+                  <span className="shrink-0 font-mono text-xs text-[var(--atlas-text-disabled)]">
+                    {groups.length}
+                  </span>
+                  <Hint label="Clear search">
+                    <button
+                      type="button"
+                      onClick={() => setSearch("")}
+                      className="flex size-5 shrink-0 cursor-pointer items-center justify-center rounded-full text-[var(--muted-foreground)] transition-colors hover:text-[var(--foreground)]"
+                    >
+                      <X size={14} />
+                    </button>
+                  </Hint>
+                </>
               )}
             </div>
-          )}
-        </div>
-      </div>
 
-      {/* Bottom fade — the cue for content below the fold, without the agent
-       *  chat's scroll-to-bottom button: a Session is read top-down and the
-       *  newest entry is not the destination.
-       *
-       *  Deeper than the chat's, and fully opaque before the controls rather
-       *  than at the very bottom edge: the action bar and the search field float
-       *  *on* this, and a linear ramp to the edge left body text legible
-       *  straight through both of them. */}
-      <div
-        aria-hidden
-        className={cn(
-          "pointer-events-none absolute inset-x-0 bottom-0 z-20 h-32 transition-opacity duration-200",
-          more ? "opacity-100" : "opacity-0",
-        )}
-        style={{
-          background:
-            "linear-gradient(to bottom, transparent 0%, color-mix(in srgb, var(--bg-surface) 60%, transparent) 28%, color-mix(in srgb, var(--bg-surface) 92%, transparent) 44%, var(--bg-surface) 55%)",
-        }}
-      />
-
-      {/* The action bar. Floating over the fade rather than docked below the
-       *  scroller: the measure is centred and a full-width toolbar would put its
-       *  controls further from the text than the text is wide. Left is what
-       *  changes the view, right is what moves through it. */}
-      <div className="pointer-events-none absolute inset-x-0 bottom-0 z-30 flex items-center gap-3 px-4 pb-3.5">
-        <BarButton
-          label="Filters"
-          active={filtersOpen || activeFilters > 0}
-          badge={activeFilters > 0 ? activeFilters : undefined}
-          onClick={() => setFiltersOpen((v) => !v)}
-        >
-          <Filter size={14} strokeWidth={1.6} />
-        </BarButton>
-
-        {/* The search field, between the two control clusters and centred in the
-         *  measure. Same pill as the memory Timeline's: floating, blurred, no
-         *  box around it — it belongs to the content, not to a toolbar. */}
-        <div className="pointer-events-auto mx-auto flex h-11 min-w-0 max-w-[620px] flex-1 items-center gap-2.5 rounded-full border border-[var(--border-default)] bg-[var(--bg-elevated)]/70 px-4 shadow-[var(--shadow-overlay)] backdrop-blur-2xl">
-          <Search size={15} className="shrink-0 text-[var(--text-tertiary)]" />
-          <input
-            value={search}
-            onChange={(e) => setSearch(e.target.value)}
-            onKeyDown={(e) => {
-              if (e.key === "Escape") setSearch("");
-            }}
-            placeholder="Search this session…"
-            spellCheck={false}
-            aria-label="Search this session"
-            className="min-w-0 flex-1 border-0 bg-transparent p-0 text-[13px] text-[var(--text-primary)] outline-none placeholder:text-[var(--text-tertiary)]"
-          />
-          {search && (
-            <>
-              <span className="shrink-0 font-mono text-[11px] text-[var(--text-ghost)]">
-                {groups.length}
-              </span>
-              <button
-                type="button"
-                onClick={() => setSearch("")}
-                aria-label="Clear search"
-                className="flex size-5 shrink-0 cursor-pointer items-center justify-center rounded-full text-[var(--text-tertiary)] transition-colors hover:text-[var(--text-primary)]"
+            <div className="pointer-events-auto flex items-center rounded-full border border-[var(--border)] bg-[var(--card)]/70 shadow-md backdrop-blur-xl">
+              {/* On a shared Session this slot finds discussions; on a local
+               *  one there are none to find, so it keeps the jump it always
+               *  had. Comments are the thing that is hard to locate in a long
+               *  record — the next prompt is only ever a scroll away. */}
+              {comments ? (
+                <BarButton
+                  label={commentsOpen ? "Close comments" : "Comments"}
+                  bare
+                  active={commentsOpen}
+                  badge={commentCount > 0 ? commentCount : undefined}
+                  disabled={!onToggleComments}
+                  onClick={onToggleComments}
+                >
+                  <MessageSquare size={14} strokeWidth={1.6} />
+                </BarButton>
+              ) : (
+                <BarButton
+                  label="Next prompt"
+                  bare
+                  disabled={!nextAnchor || activeAnchor >= anchors.length - 1}
+                  onClick={() => nextAnchor && jumpToAnchor(nextAnchor)}
+                >
+                  <ChevronsDown size={14} strokeWidth={1.6} />
+                </BarButton>
+              )}
+              <span aria-hidden className="h-4 w-px bg-[var(--border)]" />
+              <BarButton
+                label={chatOpen ? "Close chat" : "Ask about this session"}
+                bare
+                active={chatOpen}
+                disabled={!onToggleChat}
+                onClick={onToggleChat}
               >
-                <X size={14} />
-              </button>
-            </>
-          )}
-        </div>
+                <Sparkles size={14} strokeWidth={1.6} />
+              </BarButton>
+            </div>
+          </div>
+        </HintGroup>
 
-        <div className="pointer-events-auto flex items-center rounded-full border border-[var(--border-default)] bg-[var(--bg-elevated)]/70 shadow-[var(--shadow-overlay)] backdrop-blur-xl">
-          <BarButton
-            label="Next prompt"
-            bare
-            disabled={!nextAnchor || activeAnchor >= anchors.length - 1}
-            onClick={() => nextAnchor && jumpToAnchor(nextAnchor)}
-          >
-            <ChevronsDown size={14} strokeWidth={1.6} />
-          </BarButton>
-          <span aria-hidden className="h-4 w-px bg-[var(--border-default)]" />
-          <BarButton
-            label={chatOpen ? "Close chat" : "Ask about this session"}
-            bare
-            active={chatOpen}
-            disabled={!onToggleChat}
-            onClick={onToggleChat}
-          >
-            <Sparkles size={14} strokeWidth={1.6} />
-          </BarButton>
-        </div>
+        {filtersOpen && (
+          <FilterDrawer
+            detail={detail}
+            filters={filters}
+            setFilters={setFilters}
+            failedOnly={failedOnly}
+            setFailedOnly={setFailedOnly}
+            failedCount={failedCount}
+            tools={tools}
+            setTools={setTools}
+            expandTools={expandTools}
+            setExpandTools={setExpandTools}
+            foldResponses={foldResponses}
+            setFoldResponses={setFoldResponses}
+            activeFilters={activeFilters}
+            checkpoints={checkpoints}
+            onJump={(entryId) => {
+              // The drawer closes on jump. It covers the right third of the
+              // measure, and landing behind it would mean the reader has to
+              // dismiss it to see what they asked for.
+              setFiltersOpen(false);
+              setPendingJump(entryId);
+            }}
+            onClose={() => setFiltersOpen(false)}
+          />
+        )}
       </div>
-
-      {filtersOpen && (
-        <FilterDrawer
-          detail={detail}
-          filters={filters}
-          setFilters={setFilters}
-          failedOnly={failedOnly}
-          setFailedOnly={setFailedOnly}
-          failedCount={failedCount}
-          tools={tools}
-          setTools={setTools}
-          expandTools={expandTools}
-          setExpandTools={setExpandTools}
-          foldResponses={foldResponses}
-          setFoldResponses={setFoldResponses}
-          activeFilters={activeFilters}
-          checkpoints={checkpoints}
-          onJump={(entryId) => {
-            // The drawer closes on jump. It covers the right third of the
-            // measure, and landing behind it would mean the reader has to
-            // dismiss it to see what they asked for.
-            setFiltersOpen(false);
-            setPendingJump(entryId);
-          }}
-          onClose={() => setFiltersOpen(false)}
-        />
-      )}
-    </div>
+    </RemoteSourceContext.Provider>
   );
 }
 
@@ -607,7 +750,7 @@ export function SessionDetail({
  * around it rather than three rows that happen to be stacked. Export is not
  * here; it lives in the header dock with the tab's other actions.
  */
-function Masthead({ detail }: { detail: Detail }) {
+function Masthead({ detail, comments }: { detail: Detail; comments: RowComments | null }) {
   const s = detail.summary;
   const branch = s.branches[0];
   const tokens = tokenLabel(s);
@@ -643,11 +786,27 @@ function Masthead({ detail }: { detail: Detail }) {
 
   return (
     <>
-      <h1 className="text-[22px] font-semibold leading-[1.25] tracking-[-0.02em] text-[var(--text-primary)]">
-        {sessionTitle(s.title) ?? (
-          <span className="text-[var(--text-tertiary)]">Untitled session</span>
+      {/* `group/row` so the session thread's button reveals on the same hover
+       *  rule as every other one — it is the same control, at Session scope. */}
+      <div className="group/row flex items-start gap-2">
+        <h1 className="min-w-0 flex-1 text-xl font-semibold leading-[1.25] tracking-[-0.02em] text-[var(--foreground)]">
+          {sessionTitle(s.title) ?? (
+            <span className="text-[var(--muted-foreground)]">Untitled session</span>
+          )}
+        </h1>
+        {/* The whole-Session thread, for anything that is not about one step. */}
+        {comments && (
+          <CommentButton
+            anchorKind="session"
+            anchorId={s.id}
+            comments={comments.session}
+            actions={comments.actions}
+            directory={comments.directory}
+            label="Comment on this Session"
+            className="mt-1 group-hover/row:opacity-100"
+          />
         )}
-      </h1>
+      </div>
 
       <div className="mt-[22px] flex min-w-0 flex-wrap items-center gap-2">
         {s.agent && <AgentChip agent={s.agent} />}
@@ -663,12 +822,12 @@ function Masthead({ detail }: { detail: Detail }) {
             {branch}
           </Chip>
         )}
-        <span className="font-mono text-[10.5px] text-[var(--text-tertiary)]">
+        <span className="font-mono text-xs text-[var(--muted-foreground)]">
           {timeAgo(s.lastActivityAt, { suffix: true })} · {formatDuration(s.activeSeconds)}
         </span>
         {s.needsAttention && (
           <span
-            className="flex h-[22px] items-center gap-1.5 rounded-full border border-[var(--status-warning)]/25 bg-[var(--status-warning-muted)] px-2.5 font-mono text-[10.5px] text-[var(--status-warning)]"
+            className="flex h-[22px] items-center gap-1.5 rounded-full border border-[var(--atlas-status-warning-foreground)]/25 bg-[var(--atlas-status-warning-background)] px-2.5 font-mono text-xs text-[var(--atlas-status-warning-foreground)]"
             title={s.attentionReason ?? undefined}
           >
             <TriangleAlert size={11} />
@@ -679,8 +838,8 @@ function Masthead({ detail }: { detail: Detail }) {
 
       <div
         className={cn(
-          "mt-[22px] grid grid-cols-4 overflow-hidden rounded-md border border-[var(--border-default)]",
-          "[&>*+*]:border-l [&>*+*]:border-[var(--border-default)]",
+          "mt-[22px] grid grid-cols-4 overflow-hidden rounded-md border border-[var(--border)]",
+          "[&>*+*]:border-l [&>*+*]:border-[var(--border)]",
         )}
       >
         <Metric label="Active" value={formatDuration(s.activeSeconds)} sub={clock(s)} />
@@ -712,8 +871,8 @@ function Masthead({ detail }: { detail: Detail }) {
 /** One cell of the grid. The dividers are the grid's, not the cell's. */
 function Cell({ label, children }: { label: string; children: ReactNode }) {
   return (
-    <div className="min-w-0 bg-[var(--bg-raised)] px-3.5 py-3">
-      <p className="text-[10px] font-semibold uppercase tracking-[0.08em] text-[var(--text-tertiary)]">
+    <div className="min-w-0 bg-[var(--card)] px-3.5 py-3">
+      <p className="text-2xs font-semibold uppercase tracking-[0.08em] text-[var(--muted-foreground)]">
         {label}
       </p>
       {children}
@@ -741,13 +900,13 @@ function Metric({
     <Cell label={label}>
       <p
         className={cn(
-          "mt-1.5 truncate font-mono text-[17px] font-medium tracking-[-0.02em]",
-          absent ? "text-[var(--text-ghost)]" : "text-[var(--text-primary)]",
+          "mt-1.5 truncate font-mono text-lg font-medium tracking-[-0.02em]",
+          absent ? "text-[var(--atlas-text-disabled)]" : "text-[var(--foreground)]",
         )}
       >
         {value}
       </p>
-      <p className="mt-0.5 truncate font-mono text-[10px] text-[var(--text-ghost)]">{sub}</p>
+      <p className="mt-0.5 truncate font-mono text-2xs text-[var(--atlas-text-disabled)]">{sub}</p>
     </Cell>
   );
 }
@@ -777,8 +936,8 @@ function TokenMix({ spend, total }: { spend: TokenSpend; total: number }) {
   if (total <= 0) {
     return (
       <Cell label="Token mix">
-        <div className="mt-3.5 h-1.5 w-full rounded-full bg-[var(--bg-hover)]" />
-        <p className="mt-2.5 truncate font-mono text-[10px] text-[var(--text-ghost)]">
+        <div className="mt-3.5 h-1.5 w-full rounded-full bg-[var(--atlas-element-hover)]" />
+        <p className="mt-2.5 truncate font-mono text-2xs text-[var(--atlas-text-disabled)]">
           not reported
         </p>
       </Cell>
@@ -812,19 +971,22 @@ function TokenMix({ spend, total }: { spend: TokenSpend; total: number }) {
     <Cell label="Token mix">
       <div
         title={exact}
-        className="mt-3.5 flex h-1.5 w-full overflow-hidden rounded-full bg-[var(--bg-hover)]"
+        className="mt-3.5 flex h-1.5 w-full overflow-hidden rounded-full bg-[var(--atlas-element-hover)]"
       >
         {segments.map((segment) => (
           <div
             key={segment.label}
             style={{
               width: `${(segment.value / total) * 100}%`,
-              background: `rgba(255,255,255,${segment.tint})`,
+              background: `color-mix(in srgb, var(--foreground) ${segment.tint * 100}%, transparent)`,
             }}
           />
         ))}
       </div>
-      <p className="mt-2.5 truncate font-mono text-[10px] text-[var(--text-ghost)]" title={exact}>
+      <p
+        className="mt-2.5 truncate font-mono text-2xs text-[var(--atlas-text-disabled)]"
+        title={exact}
+      >
         {caption}
       </p>
     </Cell>
@@ -846,12 +1008,12 @@ function share(value: number, total: number): string {
  * rather than "very cheap".
  */
 function costLabel(cost: number): string {
-  return cost >= 0.01 ? fmtCost(cost) : "<$0.01";
+  return cost >= 0.01 ? fmtCost(cost) : `<${fmtCost(0.01)}`;
 }
 
 function Chip({ children }: { children: ReactNode }) {
   return (
-    <span className="flex h-[22px] items-center gap-1.5 rounded-full border border-[var(--border-default)] bg-[var(--bg-raised)] px-2.5 font-mono text-[10.5px] text-[var(--text-tertiary)]">
+    <span className="flex h-[22px] items-center gap-1.5 rounded-full border border-[var(--border)] bg-[var(--card)] px-2.5 font-mono text-xs text-[var(--muted-foreground)]">
       {children}
     </span>
   );
@@ -868,7 +1030,7 @@ function Chip({ children }: { children: ReactNode }) {
 function AgentChip({ agent }: { agent: string }) {
   return (
     <Chip>
-      <span className="text-[var(--text-secondary)]">
+      <span className="text-[var(--secondary-foreground)]">
         <AgentGlyph agent={agent} mono />
       </span>
       {agentLabel(agent).toLowerCase()}
@@ -942,6 +1104,7 @@ const Timeline = memo(function Timeline({
   expandTools,
   landed,
   register,
+  comments,
 }: {
   groups: Group[];
   projectPath: string;
@@ -949,6 +1112,7 @@ const Timeline = memo(function Timeline({
   expandTools: boolean;
   landed: string | null;
   register: (id: string, node: HTMLDivElement | null) => void;
+  comments: RowComments | null;
 }) {
   return (
     <>
@@ -962,7 +1126,13 @@ const Timeline = memo(function Timeline({
           agent={agent}
           expandTools={expandTools}
           isLanded={group.entries.some((e) => e.id === landed)}
+          landedCallId={
+            group.kind === "tool_call" && landed && landed !== group.entries[0].id
+              ? (group.entries.find((e) => e.id === landed)?.id ?? null)
+              : null
+          }
           register={register}
+          comments={comments}
         />
       ))}
     </>
@@ -984,7 +1154,9 @@ const Row = memo(function Row({
   agent,
   expandTools,
   isLanded,
+  landedCallId,
   register,
+  comments,
 }: {
   group: Group;
   first: boolean;
@@ -995,21 +1167,42 @@ const Row = memo(function Row({
   expandTools: boolean;
   /** A jump just landed here — ringed briefly. */
   isLanded: boolean;
+  /** The landed entry, when it is one of this row's calls rather than its head:
+   *  the run has to unfold for it. `null` for every other row, so a jump does
+   *  not re-render the whole window. */
+  landedCallId: string | null;
   register: (id: string, node: HTMLDivElement | null) => void;
+  /** `null` on a Session that is not shared — there is nothing to anchor to. */
+  comments: RowComments | null;
 }) {
   const head = group.entries[0];
+  // A group of tool calls speaks for several anchors, not one. Every comment
+  // surface below branches on it, so it is named once here.
+  const isCallRun = group.kind === "tool_call";
+  // Every thread on this row: the entry's own, plus each call's when the row is
+  // a run of them. The activity lines under a folded run are the only place a
+  // thread on its fifth call is visible without opening it.
+  const threads = useMemo(
+    () =>
+      !comments
+        ? undefined
+        : isCallRun
+          ? group.entries.flatMap((e) => comments.byAnchor[e.id] ?? [])
+          : comments.byAnchor[head.id],
+    [comments, isCallRun, group.entries, head.id],
+  );
   return (
     <div
       ref={(node) => register(head.id, node)}
       className={cn(
         "atlas-entry grid grid-cols-[32px_minmax(0,1fr)] gap-3.5 rounded-md transition-colors",
-        isLanded && "ring-1 ring-[var(--border-strong)]",
+        isLanded && "ring-1 ring-[var(--atlas-border-strong)]",
       )}
     >
       <div className="relative flex justify-center">
         <span
           aria-hidden
-          className="absolute left-1/2 -ml-px w-px bg-[var(--border-subtle)]"
+          className="absolute left-1/2 -ml-px w-px bg-[var(--atlas-border-subtle)]"
           style={{
             top: first ? NODE_CENTRE : 0,
             bottom: last ? `calc(100% - ${NODE_CENTRE}px)` : 0,
@@ -1022,55 +1215,143 @@ const Row = memo(function Row({
         <div className="flex items-baseline gap-2">
           <span
             className={cn(
-              "text-[12.5px] font-medium",
+              "text-base font-medium",
               group.kind === "checkpoint"
-                ? "text-[var(--capture-live)]"
+                ? "text-[var(--atlas-status-success-foreground)]"
                 : group.kind === "prompt"
-                  ? "text-[var(--text-primary)]"
-                  : "text-[var(--text-secondary)]",
+                  ? "text-[var(--foreground)]"
+                  : "text-[var(--secondary-foreground)]",
             )}
           >
             {kindLabel(group)}
           </span>
-          <span className="text-[var(--border-strong)]">·</span>
-          <span className="font-mono text-[10.5px] text-[var(--text-tertiary)]">
-            {time(head.at)}
-          </span>
+          <span className="text-[var(--atlas-border-strong)]">·</span>
+          <span className="font-mono text-xs text-[var(--muted-foreground)]">{time(head.at)}</span>
           {group.kind === "tool_call" && group.entries.length > 1 && (
-            <span className="font-mono text-[10.5px] text-[var(--text-ghost)]">
+            <span className="font-mono text-xs text-[var(--atlas-text-disabled)]">
               {group.entries.length} calls
             </span>
           )}
           {group.kind === "tool_call" && <CallStat calls={group.entries} />}
 
-          {/* Copy the entry, from the row's own meta line. A prompt and a
-           *  response are the two things anyone lifts out of a Session, and
-           *  hanging the control off the label keeps it out of the prose. */}
-          {(group.kind === "prompt" || group.kind === "response") && head.text && (
-            <>
-              <span className="flex-1" />
-              <CopyButton
-                text={head.text}
-                className="-my-1 self-center group-hover/row:opacity-100"
+          {/* The row's controls, pushed right. The spacer is unconditional: a
+           *  row with a comment button and no copy button still needs them
+           *  over there, and two independent `flex-1`s would split the gap. */}
+          <span className="flex-1" />
+          <ActionCluster
+            // A discussed row keeps its controls on screen. Hiding them behind
+            // hover was the bug: the comment pill was visible (it has to be —
+            // it is how a discussion announces itself) while the copy button
+            // beside it was not, so the row showed a lone pill with a hole
+            // next to it until the pointer arrived.
+            pinned={comments && !isCallRun ? visibleCount(comments.byAnchor[head.id]) > 0 : false}
+          >
+            {/* Comment first, copy second. The comment button is the one that
+             *  grows — faces and a count once a discussion exists — so
+             *  outermost would make the copy button's position depend on how
+             *  many people had replied. Every kind can be commented on, not
+             *  just the two that can be copied: a tool call and a Checkpoint
+             *  are exactly the things worth asking about.
+             *
+             *  A run of calls is the exception: this header can only anchor the
+             *  FIRST of them, so each call carries its own button instead (see
+             *  `CallRow`) and the aggregate lives on the fold. */}
+            {comments && !isCallRun && (
+              <CommentButton
+                bare
+                anchorKind={anchorKindFor(group.kind)}
+                anchorId={head.id}
+                comments={comments.byAnchor[head.id]}
+                actions={comments.actions}
+                directory={comments.directory}
               />
-            </>
-          )}
+            )}
+            {(group.kind === "prompt" || group.kind === "response") && head.text && (
+              <CopyButton text={head.text} className="opacity-100" />
+            )}
+          </ActionCluster>
         </div>
 
-        {group.kind === "tool_call" ? (
-          <Calls calls={group.entries} projectPath={projectPath} expandAll={expandTools} />
+        {isCallRun ? (
+          <Calls
+            calls={group.entries}
+            projectPath={projectPath}
+            expandAll={expandTools}
+            comments={comments}
+            revealId={landedCallId}
+          />
         ) : group.kind === "checkpoint" ? (
           <Checkpoint entry={head} />
         ) : group.kind === "prompt" ? (
           <Prompt entry={head} projectPath={projectPath} />
         ) : (
           <Clamp>
-            <div className="mt-1.5 text-[13px] leading-[1.65] text-[var(--text-secondary)]">
+            <div className="mt-1.5 text-base leading-[1.65] text-[var(--secondary-foreground)]">
               <Body entry={head} projectPath={projectPath} markdown={group.kind === "response"} />
             </div>
           </Clamp>
         )}
+
+        {comments && <ActivityLog comments={threads} directory={comments.directory} />}
       </div>
+    </div>
+  );
+});
+
+/**
+ * What was said about this node, under it.
+ *
+ * The record shows the work; these lines show the conversation about the work.
+ * A count on a button says a discussion exists — it does not say a colleague
+ * replied to you twenty minutes ago, which is the thing worth noticing while
+ * reading past.
+ *
+ * Deliberately not interactive: the thread lives one click away in the pill
+ * above, and a second way to open it would be a second place for the popover's
+ * state to live.
+ */
+const ActivityLog = memo(function ActivityLog({
+  comments,
+  directory,
+}: {
+  comments: Comment[] | undefined;
+  directory: OrgDirectory;
+}) {
+  const lines = useMemo(() => commentActivity(comments, directory), [comments, directory]);
+  if (lines.length === 0) return null;
+
+  return (
+    // The lines are 14px faces against 11px text, so they read as a dense block
+    // at a gap that would be fine for prose. Given room they read as a list.
+    <div className="mt-4 flex flex-col gap-2">
+      {lines.map((line) => {
+        const member = directory.byId.get(line.authorId) ?? null;
+        return (
+          <div key={line.id} className="flex min-w-0 items-center gap-1.5">
+            {member ? (
+              <AccountAvatar user={avatarUser(member)} size={14} />
+            ) : (
+              <span className="size-[14px] shrink-0 rounded-full bg-[var(--atlas-element-selected)]" />
+            )}
+            <span className="min-w-0 truncate text-xs text-[var(--muted-foreground)]">
+              <span className="text-[var(--secondary-foreground)]">{line.actorName}</span>{" "}
+              {!line.isReply
+                ? "commented on this"
+                : line.self
+                  ? "replied to their own comment"
+                  : line.targetName
+                    ? `replied to ${line.targetName}'s comment`
+                    : "replied to a comment"}
+              <span aria-hidden className="px-1 text-[var(--atlas-text-disabled)]">
+                ·
+              </span>
+              <span className="text-[var(--atlas-text-disabled)]">
+                {timeAgo(line.at, { suffix: true })}
+              </span>
+            </span>
+          </div>
+        );
+      })}
     </div>
   );
 });
@@ -1121,20 +1402,20 @@ function Node({
 
   const tone =
     kind === "checkpoint"
-      ? "border-[var(--capture-live)]/35 bg-[var(--capture-live)]/10 text-[var(--capture-live)]"
+      ? "border-[var(--atlas-status-success-foreground)]/35 bg-[var(--atlas-status-success-foreground)]/10 text-[var(--atlas-status-success-foreground)]"
       : failed
         ? // Still legible as a failure without a ring: the fill carries it.
-          "bg-[var(--status-error)]/70"
+          "bg-[var(--atlas-status-error-foreground)]/70"
         : bare
-          ? "bg-[var(--border-strong)]"
-          : // Prompt + response rings at half strength. At full `--border-strong`
+          ? "bg-[var(--atlas-border-strong)]"
+          : // Prompt + response rings at half strength. At full `--atlas-border-strong`
             // the outline competed with the glyph inside it, so the rail read as
             // a column of buttons rather than a quiet index of who did what.
             kind === "prompt"
-            ? "border-[var(--border-strong)]/50 bg-[var(--bg-elevated-2)] text-[var(--text-secondary)]"
+            ? "border-[var(--atlas-border-strong)]/50 bg-[var(--card)] text-[var(--secondary-foreground)]"
             : kind === "response"
-              ? "border-[var(--border-strong)]/50 bg-[var(--bg-elevated-2)] text-[var(--text-secondary)]"
-              : "border-[var(--border-default)] bg-[var(--bg-raised)] text-[var(--text-tertiary)]";
+              ? "border-[var(--atlas-border-strong)]/50 bg-[var(--card)] text-[var(--secondary-foreground)]"
+              : "border-[var(--border)] bg-[var(--card)] text-[var(--muted-foreground)]";
 
   // Tool calls and thinking stay small. They are punctuation between turns, not
   // turns themselves, and giving them an avatar-sized marker would flatten the
@@ -1191,34 +1472,67 @@ function Calls({
   calls,
   projectPath,
   expandAll,
+  comments,
+  revealId,
 }: {
   calls: TimelineEntry[];
   projectPath: string;
   expandAll: boolean;
+  comments: RowComments | null;
+  /** A jump landed on one of these calls — unfold so it can be seen. */
+  revealId?: string | null;
 }) {
   const [open, setOpen] = useState(expandAll);
   useEffect(() => setOpen(expandAll), [expandAll]);
+  // A jump to a call inside a folded run has to open the run. Not merged with
+  // the line above: `expandAll` is a switch the reader set and must stay
+  // authoritative when they turn it off again.
+  useEffect(() => {
+    if (revealId) setOpen(true);
+  }, [revealId]);
+
+  // Threads inside the fold, summed. A run of calls is folded by default, so
+  // without this the only sign of a discussion on its third call would be the
+  // count in the panel — the fold would look untouched.
+  const inside = comments
+    ? calls.reduce((n, call) => n + visibleCount(comments.byAnchor[call.id]), 0)
+    : 0;
 
   if (!open) {
     return (
       <button
         type="button"
         onClick={() => setOpen(true)}
-        className="mt-1.5 flex cursor-pointer items-center gap-1 text-[12px] text-[var(--text-tertiary)] transition-colors hover:text-[var(--text-primary)]"
+        className="mt-1.5 flex cursor-pointer items-center gap-1.5 text-sm text-[var(--muted-foreground)] transition-colors hover:text-[var(--foreground)]"
       >
         Show tool calls
         <ChevronRight size={12} />
+        {inside > 0 && (
+          <span
+            className="flex h-5 items-center gap-1 rounded-full border border-border bg-card pl-1.5 pr-1.5 text-[var(--secondary-foreground)]"
+            aria-label={`${inside} ${inside === 1 ? "comment" : "comments"} on these tool calls`}
+          >
+            <MessageSquare size={11} />
+            <span className="text-2xs tabular-nums">{inside > 9 ? "9+" : inside}</span>
+          </span>
+        )}
       </button>
     );
   }
 
   return (
     <>
-      <CallTable calls={calls} projectPath={projectPath} compact />
+      <CallTable
+        calls={calls}
+        projectPath={projectPath}
+        compact
+        comments={comments}
+        revealId={revealId}
+      />
       <button
         type="button"
         onClick={() => setOpen(false)}
-        className="mt-1.5 flex cursor-pointer items-center gap-1 text-[12px] text-[var(--text-tertiary)] transition-colors hover:text-[var(--text-primary)]"
+        className="mt-1.5 flex cursor-pointer items-center gap-1 text-sm text-[var(--muted-foreground)] transition-colors hover:text-[var(--foreground)]"
       >
         Hide tool calls
         <ChevronDown size={12} className="rotate-180" />
@@ -1242,15 +1556,17 @@ function CallStat({ calls }: { calls: TimelineEntry[] }) {
   return (
     <>
       {stat.parts.length > 0 && (
-        <span className="truncate font-mono text-[10.5px] text-[var(--text-ghost)]">
+        <span className="truncate font-mono text-xs text-[var(--atlas-text-disabled)]">
           {stat.parts.join(" · ")}
         </span>
       )}
       {stat.added > 0 && (
-        <span className="font-mono text-[10.5px] text-[var(--stat-added)]">+{stat.added}</span>
+        <span className="font-mono text-xs text-[var(--atlas-diff-added-text)]">+{stat.added}</span>
       )}
       {stat.removed > 0 && (
-        <span className="font-mono text-[10.5px] text-[var(--stat-removed)]">−{stat.removed}</span>
+        <span className="font-mono text-xs text-[var(--atlas-diff-removed-text)]">
+          −{stat.removed}
+        </span>
       )}
     </>
   );
@@ -1338,10 +1654,17 @@ function CallTable({
   calls,
   projectPath,
   compact: dense,
+  comments,
+  revealId,
 }: {
   calls: TimelineEntry[];
   projectPath: string;
   compact?: boolean;
+  comments: RowComments | null;
+  /** A jump landed on this call: expand it, and grow the window until it is
+   *  mounted. Without this a comment on the fourth call of a run scrolled the
+   *  group into view and stopped there. */
+  revealId?: string | null;
 }) {
   const [open, setOpen] = useState<string | null>(null);
   const [shown, setShown] = useState(CALL_WINDOW);
@@ -1352,9 +1675,17 @@ function CallTable({
   // A different call list is a different table — restart the window.
   useEffect(() => setShown(CALL_WINDOW), [calls]);
 
+  useEffect(() => {
+    if (!revealId) return;
+    const at = calls.findIndex((c) => c.id === revealId);
+    if (at === -1) return;
+    setShown((cur) => (at < cur ? cur : at + 1));
+    setOpen(revealId);
+  }, [revealId, calls]);
+
   if (calls.length === 0) {
     return (
-      <p className="py-10 text-center text-[12px] text-[var(--text-tertiary)]">
+      <p className="py-10 text-center text-sm text-[var(--muted-foreground)]">
         No tool calls match the current filters.
       </p>
     );
@@ -1366,7 +1697,7 @@ function CallTable({
   return (
     <div
       className={cn(
-        "overflow-hidden rounded-md border border-[var(--border-default)]",
+        "overflow-hidden rounded-md border border-[var(--border)]",
         dense ? "mt-2.5" : "mt-5",
       )}
     >
@@ -1379,13 +1710,14 @@ function CallTable({
           divider={i < visibleCalls.length - 1 || hidden > 0}
           onToggle={toggle}
           projectPath={projectPath}
+          comments={comments}
         />
       ))}
       {hidden > 0 && (
         <button
           type="button"
           onClick={() => setShown((cur) => cur + CALL_WINDOW_GROW)}
-          className="flex h-9 w-full cursor-pointer items-center justify-center bg-[var(--bg-raised)] font-mono text-[11px] text-[var(--text-tertiary)] transition-colors hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)]"
+          className="flex h-9 w-full cursor-pointer items-center justify-center bg-[var(--card)] font-mono text-xs text-[var(--muted-foreground)] transition-colors hover:bg-[var(--atlas-element-hover)] hover:text-[var(--foreground)]"
         >
           Show {Math.min(CALL_WINDOW_GROW, hidden)} more of {hidden}…
         </button>
@@ -1396,6 +1728,17 @@ function CallTable({
 
 /**
  * One call: the summary row, and the recorded payloads when expanded.
+ *
+ * The line is the transcript's — glyph, verb, target (`toolLine`) — rather than
+ * the `toolName` / `paths[0]` columns it used to be. The two surfaces show the
+ * same events to the same reader, and a comment made here is read back beside
+ * that call in the live chat; recognising the call in both is the point.
+ *
+ * The comment button is on the CALL, not on the group above it. A group is a run
+ * of consecutive calls and its header could only ever anchor the first one, so a
+ * thread on the fourth call of a run had nowhere to render — it counted in the
+ * panel and the badge and appeared nowhere in the timeline, which is the bug this
+ * replaces.
  *
  * Memoised so the table's own state changes touch only the rows they concern:
  * expanding a call re-renders that row and the one it closed, not every row in
@@ -1408,6 +1751,7 @@ const CallRow = memo(function CallRow({
   divider,
   onToggle,
   projectPath,
+  comments,
 }: {
   call: TimelineEntry;
   dense?: boolean;
@@ -1415,48 +1759,91 @@ const CallRow = memo(function CallRow({
   divider: boolean;
   onToggle: (id: string) => void;
   projectPath: string;
+  /** `null` on a Session that is not shared — there is nothing to anchor to. */
+  comments: RowComments | null;
 }) {
   const failed = call.toolStatus === "failed";
+  // One parse of the recorded arguments per call, not per render: the table can
+  // hold a Session's whole call history.
+  const line = useMemo(() => toolLine(call), [call]);
+  const thread = comments?.byAnchor[call.id];
   return (
     <div>
-      <button
-        type="button"
-        onClick={() => onToggle(call.id)}
+      <div
         className={cn(
-          "grid w-full cursor-pointer items-center gap-3 bg-[var(--bg-raised)] px-3 text-left transition-colors hover:bg-[var(--bg-hover)]",
-          dense
-            ? "h-8 grid-cols-[76px_minmax(0,1fr)_16px]"
-            : "h-9 grid-cols-[64px_76px_minmax(0,1fr)_16px]",
-          divider && "border-b border-[var(--border-subtle)]",
+          "group/row flex items-center gap-2 bg-[var(--card)] px-3 transition-colors hover:bg-[var(--atlas-element-hover)]",
+          dense ? "h-8" : "h-9",
+          divider && "border-b border-[var(--atlas-border-subtle)]",
         )}
       >
         {!dense && (
-          <span className="font-mono text-[10.5px] text-[var(--text-ghost)]">{time(call.at)}</span>
+          <span className="shrink-0 font-mono text-xs text-[var(--atlas-text-disabled)]">
+            {time(call.at)}
+          </span>
         )}
-        <span
-          className={cn(
-            "truncate font-mono text-[11px]",
-            failed ? "text-[var(--status-error)]" : "text-[var(--status-info)]",
-          )}
+        <button
+          type="button"
+          onClick={() => onToggle(call.id)}
+          title={line.detail ? `${line.verb} ${line.detail}` : line.verb}
+          className="group/marker flex min-w-0 flex-1 cursor-pointer items-center gap-2 text-left"
         >
-          {call.toolName ?? "Other"}
-        </span>
-        <span className="min-w-0 truncate font-mono text-[11px] text-[var(--text-tertiary)]">
-          {call.paths[0] ?? call.toolTitle ?? ""}
-        </span>
-        <ChevronRight
-          size={12}
-          className={cn(
-            "text-[var(--border-strong)] transition-transform",
-            expanded && "rotate-90",
-          )}
-        />
-      </button>
+          <span className="flex w-4 shrink-0 justify-center text-[var(--muted-foreground)]">
+            <ToolGlyph tool={line.tool} failed={failed} />
+          </span>
+          {/* One run of text, so verb and target read as a sentence and a long
+              command truncates as a line rather than as a separate column. */}
+          <span
+            className={cn(
+              "min-w-0 truncate text-sm",
+              failed
+                ? "text-[var(--atlas-status-error-foreground)]"
+                : "text-[var(--secondary-foreground)]",
+            )}
+          >
+            {line.verb}
+            {line.detail && (
+              <>
+                {" "}
+                <span
+                  className={cn(
+                    line.fileDetail &&
+                      "text-[var(--atlas-text-disabled)] underline decoration-dotted underline-offset-[3px] group-hover/marker:text-[var(--secondary-foreground)]",
+                  )}
+                >
+                  {line.detail}
+                </span>
+              </>
+            )}
+          </span>
+          <ChevronRight
+            size={12}
+            className={cn(
+              "shrink-0 text-[var(--atlas-border-strong)] transition-transform",
+              expanded && "rotate-90",
+            )}
+          />
+        </button>
+        {/* A discussed call keeps its button on screen — that is how the
+            discussion announces itself; an undiscussed one reveals on hover
+            like every other Timeline control. */}
+        {comments && (
+          <ActionCluster pinned={visibleCount(thread) > 0}>
+            <CommentButton
+              bare
+              anchorKind="tool_call"
+              anchorId={call.id}
+              comments={thread}
+              actions={comments.actions}
+              directory={comments.directory}
+            />
+          </ActionCluster>
+        )}
+      </div>
 
       {expanded && (
-        <div className="space-y-2.5 border-b border-[var(--border-subtle)] bg-[var(--bg-base)] px-3 py-3">
+        <div className="space-y-2.5 border-b border-[var(--atlas-border-subtle)] bg-[var(--background)] px-3 py-3">
           {call.paths.length > 0 && (
-            <p className="font-mono text-[11px] text-[var(--text-tertiary)]">
+            <p className="font-mono text-xs text-[var(--muted-foreground)]">
               {call.paths.join("  ·  ")}
             </p>
           )}
@@ -1467,10 +1854,12 @@ const CallRow = memo(function CallRow({
               json
               projectPath={projectPath}
               blobRef={spilledRef(call.argumentsRef, call.arguments)}
+              rowId={call.id}
+              part="arguments"
             />
           )}
           {call.resultBinary ? (
-            <p className="font-mono text-[11px] text-[var(--text-tertiary)]">
+            <p className="font-mono text-xs text-[var(--muted-foreground)]">
               The result is binary and is not shown.
             </p>
           ) : (
@@ -1481,11 +1870,13 @@ const CallRow = memo(function CallRow({
                 path={call.paths[0]}
                 projectPath={projectPath}
                 blobRef={spilledRef(call.resultRef, call.result)}
+                rowId={call.id}
+                part="result"
               />
             )
           )}
           {!call.arguments && !call.result && !call.resultBinary && (
-            <p className="font-mono text-[11px] text-[var(--text-ghost)]">
+            <p className="font-mono text-xs text-[var(--atlas-text-disabled)]">
               Nothing else was recorded for this call.
             </p>
           )}
@@ -1512,26 +1903,26 @@ function Checkpoint({ entry }: { entry: TimelineEntry }) {
       className={cn(
         "mt-2.5 overflow-hidden rounded-md border",
         orphaned
-          ? "border-dashed border-[var(--border-strong)]"
-          : "border-[var(--border-default)] bg-[var(--bg-raised)]",
+          ? "border-dashed border-[var(--atlas-border-strong)]"
+          : "border-[var(--border)] bg-[var(--card)]",
       )}
     >
-      <div className="flex items-center gap-2.5 border-b border-[var(--border-subtle)] bg-[var(--bg-elevated)] px-3 py-2">
-        <GitCommitHorizontal size={13} className="shrink-0 text-[var(--text-tertiary)]" />
-        <span className="shrink-0 font-mono text-[11px] text-[var(--text-tertiary)]">
+      <div className="flex items-center gap-2.5 border-b border-[var(--atlas-border-subtle)] bg-[var(--card)] px-3 py-2">
+        <GitCommitHorizontal size={13} className="shrink-0 text-[var(--muted-foreground)]" />
+        <span className="shrink-0 font-mono text-xs text-[var(--muted-foreground)]">
           {entry.commitSha?.slice(0, 7)}
         </span>
         <span
           className={cn(
-            "min-w-0 flex-1 truncate text-[12px]",
-            orphaned ? "text-[var(--text-secondary)]" : "text-[var(--text-primary)]",
+            "min-w-0 flex-1 truncate text-sm",
+            orphaned ? "text-[var(--secondary-foreground)]" : "text-[var(--foreground)]",
           )}
         >
           {entry.commitSubject ?? (
             // The Checkpoint is a real record even when git can no longer
             // resolve it — a moved repository or a pruned commit must not
             // erase it.
-            <span className="text-[var(--text-tertiary)]">
+            <span className="text-[var(--muted-foreground)]">
               {orphaned ? "Commit no longer reachable" : "Subject unavailable"}
             </span>
           )}
@@ -1542,19 +1933,19 @@ function Checkpoint({ entry }: { entry: TimelineEntry }) {
          *  whole subsystem exists to avoid. */}
         {orphaned && (
           <span
-            className="shrink-0 rounded-full bg-[var(--status-warning-muted)] px-2 py-px font-mono text-[10px] text-[var(--status-warning)]"
+            className="shrink-0 rounded-full bg-[var(--atlas-status-warning-background)] px-2 py-px font-mono text-2xs text-[var(--atlas-status-warning-foreground)]"
             title="This commit is no longer in history — rewritten or squashed. The Session record is kept."
           >
             orphaned
           </span>
         )}
         {entry.insertions > 0 && (
-          <span className="shrink-0 font-mono text-[10.5px] text-[var(--stat-added)]">
+          <span className="shrink-0 font-mono text-xs text-[var(--atlas-diff-added-text)]">
             +{entry.insertions}
           </span>
         )}
         {entry.deletions > 0 && (
-          <span className="shrink-0 font-mono text-[10.5px] text-[var(--stat-removed)]">
+          <span className="shrink-0 font-mono text-xs text-[var(--atlas-diff-removed-text)]">
             −{entry.deletions}
           </span>
         )}
@@ -1565,13 +1956,13 @@ function Checkpoint({ entry }: { entry: TimelineEntry }) {
           {entry.files.slice(0, 12).map((file) => (
             <li
               key={file}
-              className="truncate font-mono text-[11px] leading-[1.75] text-[var(--text-tertiary)]"
+              className="truncate font-mono text-xs leading-[1.75] text-[var(--muted-foreground)]"
             >
               {file}
             </li>
           ))}
           {entry.files.length > 12 && (
-            <li className="font-mono text-[11px] leading-[1.75] text-[var(--text-ghost)]">
+            <li className="font-mono text-xs leading-[1.75] text-[var(--atlas-text-disabled)]">
               +{entry.files.length - 12} more
             </li>
           )}
@@ -1581,7 +1972,7 @@ function Checkpoint({ entry }: { entry: TimelineEntry }) {
       {/* Suppressed when orphaned: the branch no longer contains this commit,
        *  so showing it would assert exactly the link that was lost. */}
       {entry.branch && !orphaned && (
-        <p className="border-t border-[var(--border-subtle)] px-3 py-1.5 font-mono text-[10.5px] text-[var(--text-ghost)]">
+        <p className="border-t border-[var(--atlas-border-subtle)] px-3 py-1.5 font-mono text-xs text-[var(--atlas-text-disabled)]">
           {entry.branch}
         </p>
       )}
@@ -1660,32 +2051,33 @@ function FilterDrawer({
       {/* Scrim — subtle; the blurred panel carries the depth, as in the
        *  notification centre. Clicking it dismisses. */}
       <div
-        className="animate-fade-in absolute inset-0 z-40 bg-black/10"
+        className="animate-fade-in absolute inset-0 z-overlay scrim-soft"
         onClick={onClose}
         aria-hidden
       />
       <aside
         role="dialog"
         aria-label="Filters"
-        className="animate-slide-in-right absolute bottom-0 right-0 top-0 z-50 flex w-[340px] flex-col border-l border-[var(--border-default)] bg-[var(--bg-elevated)]/60 shadow-[var(--shadow-overlay)] backdrop-blur-2xl"
+        className="animate-slide-in-right absolute bottom-0 right-0 top-0 z-modal flex w-[340px] flex-col border-l border-[var(--border)] bg-[var(--card)]/60 shadow-md backdrop-blur-2xl"
       >
         {/* No header row at all. With no active filters it was an empty strip
          *  holding one X — the close button floats over the content instead,
          *  and the "N active · Reset" affordance rides as the content's first
          *  row only when there is something to reset. */}
-        <button
-          type="button"
-          onClick={onClose}
-          aria-label="Close filters"
-          className="absolute right-2 top-2 z-10 flex size-6 cursor-pointer items-center justify-center rounded text-[var(--text-tertiary)] transition-colors hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)]"
-        >
-          <X size={14} />
-        </button>
+        <Hint label="Close filters">
+          <button
+            type="button"
+            onClick={onClose}
+            className="absolute right-2 top-2 z-10 flex size-6 cursor-pointer items-center justify-center rounded text-[var(--muted-foreground)] transition-colors hover:bg-[var(--atlas-element-hover)] hover:text-[var(--foreground)]"
+          >
+            <X size={14} />
+          </button>
+        </Hint>
 
         <div className="hide-scrollbar flex min-h-0 flex-1 flex-col gap-5 overflow-y-auto px-4 pb-8 pt-4">
           {activeFilters > 0 && (
             <div className="flex items-center gap-2 pr-8">
-              <span className="font-mono text-[10px] text-[var(--text-tertiary)]">
+              <span className="font-mono text-2xs text-[var(--muted-foreground)]">
                 {activeFilters} active
               </span>
               <button
@@ -1695,7 +2087,7 @@ function FilterDrawer({
                   setFailedOnly(false);
                   setTools(() => new Set());
                 }}
-                className="h-[22px] cursor-pointer rounded-full border border-[var(--border-default)] bg-[var(--bg-elevated)] px-2.5 font-mono text-[10px] uppercase tracking-[0.06em] text-[var(--text-tertiary)] transition-colors hover:text-[var(--text-primary)]"
+                className="h-[22px] cursor-pointer rounded-full border border-[var(--border)] bg-[var(--card)] px-2.5 font-mono text-2xs uppercase tracking-[0.06em] text-[var(--muted-foreground)] transition-colors hover:text-[var(--foreground)]"
               >
                 Reset
               </button>
@@ -1767,13 +2159,13 @@ function FilterDrawer({
               count={failedCount}
               on={failedOnly}
               enabled={failedCount > 0}
-              dot="var(--status-error)"
+              dot="var(--atlas-status-error-foreground)"
               onClick={() => setFailedOnly(!failedOnly)}
             />
           </Section>
 
-          <div className="border-t border-dashed border-[var(--border-subtle)] pt-4">
-            <p className="text-[10px] font-semibold uppercase tracking-[0.08em] text-[var(--text-tertiary)]">
+          <div className="border-t border-dashed border-[var(--atlas-border-subtle)] pt-4">
+            <p className="text-2xs font-semibold uppercase tracking-[0.08em] text-[var(--muted-foreground)]">
               Session
             </p>
             <dl className="mt-2.5 flex flex-col gap-2">
@@ -1794,7 +2186,7 @@ function FilterDrawer({
             </dl>
 
             {s.source === "external_jsonl" && (
-              <p className="mt-4 rounded-md border border-dashed border-[var(--border-default)] px-3 py-2.5 text-[11.5px] leading-[1.55] text-[var(--text-tertiary)]">
+              <p className="mt-4 rounded-md border border-dashed border-[var(--border)] px-3 py-2.5 text-sm leading-[1.55] text-[var(--muted-foreground)]">
                 Imported session — read from a transcript on disk. Commits aren&apos;t linked to
                 imported history, and token usage wasn&apos;t recorded.
               </p>
@@ -1851,80 +2243,84 @@ function CheckpointJump({
         if (!v) setQuery("");
       }}
     >
-      <Popover.Trigger asChild>
-        <button
-          type="button"
-          className="flex h-9 w-full cursor-pointer items-center gap-2 rounded-lg border border-[var(--border-default)] bg-[var(--bg-raised)] px-3 text-left text-[12.5px] text-[var(--text-secondary)] transition-colors hover:border-[var(--border-strong)] hover:text-[var(--text-primary)]"
-        >
-          <span className="flex-1">Jump to</span>
-          <ChevronDown size={13} className="shrink-0 text-[var(--text-tertiary)]" />
-        </button>
-      </Popover.Trigger>
+      <Popover.Trigger
+        render={
+          <button
+            type="button"
+            className="flex h-9 w-full cursor-pointer items-center gap-2 rounded-lg border border-[var(--border)] bg-[var(--card)] px-3 text-left text-base text-[var(--secondary-foreground)] transition-colors hover:border-[var(--atlas-border-strong)] hover:text-[var(--foreground)]"
+          >
+            <span className="flex-1">Jump to</span>
+            <ChevronDown size={13} className="shrink-0 text-[var(--muted-foreground)]" />
+          </button>
+        }
+      />
       <Popover.Portal>
-        <Popover.Content
-          align="start"
-          sideOffset={6}
-          className="z-[var(--z-max)] flex max-h-[320px] w-[var(--radix-popover-trigger-width)] origin-[var(--radix-popover-content-transform-origin)] flex-col overflow-hidden rounded-lg border border-[var(--border-default)] bg-[var(--bg-elevated)]/95 shadow-[var(--shadow-overlay)] backdrop-blur-2xl data-[state=closed]:animate-scale-out data-[state=open]:animate-scale-in"
-        >
-          {/* The search only appears when there is enough to search. */}
-          {checkpoints.length > 4 && (
-            <div className="flex h-8 shrink-0 items-center gap-2 border-b border-[var(--border-default)] px-2.5">
-              <Search size={12} className="shrink-0 text-[var(--text-tertiary)]" />
-              <input
-                value={query}
-                onChange={(e) => setQuery(e.target.value)}
-                placeholder="Find a commit…"
-                spellCheck={false}
-                autoFocus
-                className="min-w-0 flex-1 border-0 bg-transparent p-0 text-[12px] text-[var(--text-primary)] outline-none placeholder:text-[var(--text-tertiary)]"
-              />
-            </div>
-          )}
-
-          <div className="hide-scrollbar min-h-0 flex-1 overflow-y-auto p-1">
-            {matches.length === 0 ? (
-              <p className="px-2 py-3 text-center text-[11.5px] text-[var(--text-tertiary)]">
-                No match.
-              </p>
-            ) : (
-              matches.map((checkpoint, i) => {
-                const sha = checkpoint.commitSha ?? "";
-                const changed = checkpoint.insertions + checkpoint.deletions;
-                return (
-                  <button
-                    key={checkpoint.id}
-                    type="button"
-                    onClick={() => {
-                      onJump(checkpoint.id);
-                      setOpen(false);
-                    }}
-                    className="flex w-full cursor-pointer flex-col gap-0.5 rounded-md px-2 py-1.5 text-left transition-colors hover:bg-[var(--bg-hover)]"
-                  >
-                    <span className="truncate text-[12.5px] text-[var(--text-secondary)]">
-                      {checkpoint.commitSubject ?? (
-                        <span className="text-[var(--text-tertiary)]">Subject unavailable</span>
-                      )}
-                    </span>
-                    <span className="flex items-center gap-1.5 font-mono text-[10.5px] text-[var(--text-ghost)]">
-                      <span>
-                        #{ordinal.get(checkpoint.id) ?? i + 1} · {sha.slice(0, 7)}
-                      </span>
-                      {changed > 0 && (
-                        <>
-                          <span>·</span>
-                          <span className="text-[var(--stat-added)]">+{checkpoint.insertions}</span>
-                          <span className="text-[var(--stat-removed)]">
-                            −{checkpoint.deletions}
-                          </span>
-                        </>
-                      )}
-                    </span>
-                  </button>
-                );
-              })
+        <Popover.Positioner className="z-popover" align="start" sideOffset={6}>
+          <Popover.Popup className="flex max-h-[320px] w-[var(--anchor-width)] origin-[var(--transform-origin)] flex-col overflow-hidden rounded-lg border border-[var(--border)] bg-[var(--card)]/95 shadow-md backdrop-blur-2xl data-closed:animate-scale-out data-open:animate-scale-in">
+            {/* The search only appears when there is enough to search. */}
+            {checkpoints.length > 4 && (
+              <div className="flex h-8 shrink-0 items-center gap-2 border-b border-[var(--border)] px-2.5">
+                <Search size={12} className="shrink-0 text-[var(--muted-foreground)]" />
+                <input
+                  value={query}
+                  onChange={(e) => setQuery(e.target.value)}
+                  placeholder="Find a commit…"
+                  spellCheck={false}
+                  autoFocus
+                  className="min-w-0 flex-1 border-0 bg-transparent p-0 text-sm text-[var(--foreground)] outline-none placeholder:text-[var(--muted-foreground)]"
+                />
+              </div>
             )}
-          </div>
-        </Popover.Content>
+
+            <div className="hide-scrollbar min-h-0 flex-1 overflow-y-auto p-1">
+              {matches.length === 0 ? (
+                <p className="px-2 py-3 text-center text-sm text-[var(--muted-foreground)]">
+                  No match.
+                </p>
+              ) : (
+                matches.map((checkpoint, i) => {
+                  const sha = checkpoint.commitSha ?? "";
+                  const changed = checkpoint.insertions + checkpoint.deletions;
+                  return (
+                    <button
+                      key={checkpoint.id}
+                      type="button"
+                      onClick={() => {
+                        onJump(checkpoint.id);
+                        setOpen(false);
+                      }}
+                      className="flex w-full cursor-pointer flex-col gap-0.5 rounded-md px-2 py-1.5 text-left transition-colors hover:bg-[var(--atlas-element-hover)]"
+                    >
+                      <span className="truncate text-base text-[var(--secondary-foreground)]">
+                        {checkpoint.commitSubject ?? (
+                          <span className="text-[var(--muted-foreground)]">
+                            Subject unavailable
+                          </span>
+                        )}
+                      </span>
+                      <span className="flex items-center gap-1.5 font-mono text-xs text-[var(--atlas-text-disabled)]">
+                        <span>
+                          #{ordinal.get(checkpoint.id) ?? i + 1} · {sha.slice(0, 7)}
+                        </span>
+                        {changed > 0 && (
+                          <>
+                            <span>·</span>
+                            <span className="text-[var(--atlas-diff-added-text)]">
+                              +{checkpoint.insertions}
+                            </span>
+                            <span className="text-[var(--atlas-diff-removed-text)]">
+                              −{checkpoint.deletions}
+                            </span>
+                          </>
+                        )}
+                      </span>
+                    </button>
+                  );
+                })
+              )}
+            </div>
+          </Popover.Popup>
+        </Popover.Positioner>
       </Popover.Portal>
     </Popover.Root>
   );
@@ -1934,10 +2330,12 @@ function Section({ label, hint, children }: { label: string; hint?: string; chil
   return (
     <div>
       <div className="flex items-baseline gap-2">
-        <span className="text-[10px] font-semibold uppercase tracking-[0.08em] text-[var(--text-tertiary)]">
+        <span className="text-2xs font-semibold uppercase tracking-[0.08em] text-[var(--muted-foreground)]">
           {label}
         </span>
-        {hint && <span className="font-mono text-[10px] text-[var(--text-ghost)]">{hint}</span>}
+        {hint && (
+          <span className="font-mono text-2xs text-[var(--atlas-text-disabled)]">{hint}</span>
+        )}
       </div>
       <div className="mt-2.5 flex flex-wrap gap-1.5">{children}</div>
     </div>
@@ -1965,19 +2363,19 @@ function FilterChip({
       disabled={!enabled}
       onClick={onClick}
       className={cn(
-        "flex h-[26px] items-center gap-1.5 rounded-full border px-2.5 text-[12px] transition-colors",
+        "flex h-[26px] items-center gap-1.5 rounded-full border px-2.5 text-sm transition-colors",
         !enabled
-          ? "cursor-default border-[var(--border-subtle)] text-[var(--text-ghost)]"
+          ? "cursor-default border-[var(--atlas-border-subtle)] text-[var(--atlas-text-disabled)]"
           : on
-            ? "cursor-pointer border-[var(--border-strong)] bg-[var(--bg-active)] text-[var(--text-primary)]"
-            : "cursor-pointer border-[var(--border-default)] text-[var(--text-tertiary)] hover:bg-[var(--bg-hover)]",
+            ? "cursor-pointer border-[var(--atlas-border-strong)] bg-[var(--atlas-element-active)] text-[var(--foreground)]"
+            : "cursor-pointer border-[var(--border)] text-[var(--muted-foreground)] hover:bg-[var(--atlas-element-hover)]",
       )}
     >
       {dot && enabled && (
         <span className="size-[5px] rounded-full" style={{ backgroundColor: dot }} />
       )}
       {label}
-      <span className="font-mono text-[10px] text-[var(--text-ghost)]">{count}</span>
+      <span className="font-mono text-2xs text-[var(--atlas-text-disabled)]">{count}</span>
     </button>
   );
 }
@@ -1985,8 +2383,8 @@ function FilterChip({
 function Meta({ label, value }: { label: string; value: string }) {
   return (
     <div className="flex items-baseline justify-between gap-3">
-      <dt className="shrink-0 text-[12px] text-[var(--text-tertiary)]">{label}</dt>
-      <dd className="truncate font-mono text-[11px] text-[var(--text-secondary)]">{value}</dd>
+      <dt className="shrink-0 text-sm text-[var(--muted-foreground)]">{label}</dt>
+      <dd className="truncate font-mono text-xs text-[var(--secondary-foreground)]">{value}</dd>
     </div>
   );
 }
@@ -2018,30 +2416,31 @@ function BarButton({
   children: ReactNode;
 }) {
   return (
-    <button
-      type="button"
-      title={label}
-      aria-label={label}
-      disabled={disabled}
-      onClick={onClick}
-      className={cn(
-        "pointer-events-auto relative flex size-8 shrink-0 items-center justify-center rounded-full transition-colors",
-        disabled
-          ? "cursor-default text-[var(--text-ghost)]"
-          : "cursor-pointer text-[var(--text-tertiary)] hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)]",
-        !bare &&
-          "border border-[var(--border-default)] bg-[var(--bg-elevated)]/70 backdrop-blur-xl",
-        !bare && "shadow-[var(--shadow-overlay)]",
-        active && !bare && "border-[var(--border-strong)] text-[var(--text-primary)]",
-      )}
-    >
-      {children}
-      {badge !== undefined && (
-        <span className="absolute -right-0.5 -top-0.5 flex size-3.5 items-center justify-center rounded-full bg-[var(--accent-primary)] font-mono text-[8px] font-semibold text-[var(--bg-base)]">
-          {badge}
-        </span>
-      )}
-    </button>
+    // The bar is `pointer-events-none`; the item's span has to take the hover
+    // itself, or a disabled button (which passes events through) shows nothing.
+    <HintItem label={label} className="pointer-events-auto">
+      <button
+        type="button"
+        disabled={disabled}
+        onClick={onClick}
+        className={cn(
+          "pointer-events-auto relative flex size-8 shrink-0 items-center justify-center rounded-full transition-colors",
+          disabled
+            ? "cursor-default text-[var(--atlas-text-disabled)]"
+            : "cursor-pointer text-[var(--muted-foreground)] hover:bg-[var(--atlas-element-hover)] hover:text-[var(--foreground)]",
+          !bare && "border border-[var(--border)] bg-[var(--card)]/70 backdrop-blur-xl",
+          !bare && "shadow-md",
+          active && !bare && "border-[var(--atlas-border-strong)] text-[var(--foreground)]",
+        )}
+      >
+        {children}
+        {badge !== undefined && (
+          <span className="absolute -right-0.5 -top-0.5 flex h-3.5 min-w-3.5 items-center justify-center rounded-full bg-[var(--primary)] px-0.5 font-mono text-3xs font-semibold text-[var(--primary-foreground)] tabular-nums">
+            {badge > 9 ? "9+" : badge}
+          </span>
+        )}
+      </button>
+    </HintItem>
   );
 }
 
@@ -2089,7 +2488,7 @@ function Clamp({ children }: { children: ReactNode }) {
           aria-hidden
           className="pointer-events-none absolute inset-x-0 bottom-0 h-16"
           style={{
-            background: "linear-gradient(to bottom, transparent, var(--bg-surface))",
+            background: "linear-gradient(to bottom, transparent, var(--background))",
           }}
         />
       )}
@@ -2106,7 +2505,7 @@ function Clamp({ children }: { children: ReactNode }) {
           <button
             type="button"
             onClick={() => setExpanded((v) => !v)}
-            className="flex h-7 cursor-pointer items-center gap-1.5 rounded-full border border-[var(--border-default)] bg-[var(--bg-elevated)] px-3 text-[11.5px] text-[var(--text-secondary)] shadow-[var(--shadow-overlay)] transition-colors hover:border-[var(--border-strong)] hover:text-[var(--text-primary)]"
+            className="flex h-7 cursor-pointer items-center gap-1.5 rounded-full border border-[var(--border)] bg-[var(--card)] px-3 text-sm text-[var(--secondary-foreground)] shadow-md transition-colors hover:border-[var(--atlas-border-strong)] hover:text-[var(--foreground)]"
           >
             <ChevronDown
               size={12}
@@ -2182,30 +2581,35 @@ function MemoryBlock({ block }: { block: InjectedBlock }) {
   const lines = block.body ? block.body.split("\n").length : 0;
 
   return (
-    <div className="overflow-hidden rounded-lg border border-[var(--border-subtle)] bg-[var(--bg-raised)]">
+    <div className="overflow-hidden rounded-lg border border-[var(--atlas-border-subtle)] bg-[var(--card)]">
       <button
         type="button"
         onClick={() => setOpen((v) => !v)}
-        className="flex w-full cursor-pointer items-center gap-2 px-3 py-2 text-left transition-colors hover:bg-[var(--bg-hover)]"
+        className="flex w-full cursor-pointer items-center gap-2 px-3 py-2 text-left transition-colors hover:bg-[var(--atlas-element-hover)]"
       >
-        <AtlasIcon size={12} className="shrink-0 rounded-[2px]" />
-        <span className="text-[12px] text-[var(--text-secondary)]">
+        <AtlasIcon size={12} className="shrink-0 rounded-sm" />
+        <span className="text-sm text-[var(--secondary-foreground)]">
           {MEMORY_LABELS[block.label] ?? block.label.toLowerCase()}
         </span>
-        <span className="font-mono text-[10.5px] text-[var(--text-ghost)]">from Atlas memory</span>
+        <span className="font-mono text-xs text-[var(--atlas-text-disabled)]">
+          from Atlas memory
+        </span>
         <span className="flex-1" />
         {lines > 0 && (
-          <span className="font-mono text-[10.5px] text-[var(--text-ghost)]">
+          <span className="font-mono text-xs text-[var(--atlas-text-disabled)]">
             {lines} line{lines === 1 ? "" : "s"}
           </span>
         )}
         <ChevronRight
           size={12}
-          className={cn("text-[var(--border-strong)] transition-transform", open && "rotate-90")}
+          className={cn(
+            "text-[var(--atlas-border-strong)] transition-transform",
+            open && "rotate-90",
+          )}
         />
       </button>
       {open && (
-        <div className="hide-scrollbar max-h-[320px] overflow-auto whitespace-pre-wrap break-words border-t border-[var(--border-subtle)] px-3.5 py-2.5 font-mono text-[11px] leading-[1.7] text-[var(--text-tertiary)]">
+        <div className="hide-scrollbar max-h-[320px] overflow-auto whitespace-pre-wrap break-words border-t border-[var(--atlas-border-subtle)] px-3.5 py-2.5 font-mono text-xs leading-[1.7] text-[var(--muted-foreground)]">
           {block.body || "(empty)"}
         </div>
       )}
@@ -2224,7 +2628,7 @@ function Block({
   projectPath: string;
 }) {
   return (
-    <div className="mt-2.5 whitespace-pre-wrap break-words rounded-md border border-[var(--border-subtle)] bg-[var(--bg-raised)] px-3.5 py-3 font-mono text-[11.5px] leading-[1.75] text-[var(--text-secondary)]">
+    <div className="mt-2.5 whitespace-pre-wrap break-words rounded-md border border-[var(--atlas-border-subtle)] bg-[var(--card)] px-3.5 py-3 font-mono text-sm leading-[1.75] text-[var(--secondary-foreground)]">
       <Body entry={entry} projectPath={projectPath} raw={text} />
     </div>
   );
@@ -2237,6 +2641,8 @@ function Pre({
   json,
   projectPath,
   blobRef,
+  rowId,
+  part,
 }: {
   label: string;
   text: string;
@@ -2245,7 +2651,10 @@ function Pre({
   json?: boolean;
   projectPath: string;
   blobRef: string | null;
+  rowId: string;
+  part: PayloadPart;
 }) {
+  const remote = useContext(RemoteSourceContext);
   const [full, setFull] = useState<string | null>(null);
   const source = full ?? text;
   const pretty = json ? prettyJson(source) : { text: source, json: false };
@@ -2257,8 +2666,14 @@ function Pre({
         label={label}
         language={pretty.json ? "JSON" : undefined}
       />
-      {blobRef && full === null && (
-        <ShowFull projectPath={projectPath} blobRef={blobRef} onLoaded={setFull} />
+      {(blobRef || remote) && full === null && (
+        <ShowFull
+          projectPath={projectPath}
+          blobRef={blobRef}
+          rowId={rowId}
+          part={part}
+          onLoaded={setFull}
+        />
       )}
     </div>
   );
@@ -2290,16 +2705,23 @@ function Body({
   /** Pre-resolved text, when the caller already has it. */
   raw?: string;
 }) {
+  const remote = useContext(RemoteSourceContext);
   const [full, setFull] = useState<string | null>(null);
   const truncated = entry.truncated && full === null;
 
   const notice = truncated && (
     <>
-      <span className="ml-1 text-[11px] text-[var(--text-tertiary)]">
+      <span className="ml-1 text-xs text-[var(--muted-foreground)]">
         … {compact(entry.bodyBytes)} bytes not shown
       </span>
-      {entry.bodyRef && (
-        <ShowFull projectPath={projectPath} blobRef={entry.bodyRef} onLoaded={setFull} />
+      {(entry.bodyRef || remote) && (
+        <ShowFull
+          projectPath={projectPath}
+          blobRef={entry.bodyRef}
+          rowId={entry.id}
+          part="body"
+          onLoaded={setFull}
+        />
       )}
     </>
   );
@@ -2322,20 +2744,36 @@ function Body({
 }
 
 /**
- * Fetch a spilled payload on demand.
+ * Expand a payload the timeline only carries a preview of.
  *
  * The failure copy matters: a pruned blob store is a real state (the Session
  * still renders from previews) and "could not load" must not read as a crash.
+ *
+ * Two sources, because there are two places an oversized payload can live. A
+ * Session captured on this machine spilled it to the local blob sidecar and is
+ * addressed by content key. One captured elsewhere was never written here at
+ * all — the server holds it, addressed by the entry's row id and which part of
+ * it you want. `blobRef` picks the first; the remote context picks the second.
  */
+/** Which half of an entry to fetch. Mirrors the server's `part` parameter. */
+type PayloadPart = "body" | "arguments" | "result";
+
 function ShowFull({
   projectPath,
   blobRef,
   onLoaded,
+  rowId,
+  part,
 }: {
   projectPath: string;
-  blobRef: string;
+  /** `null` on a remote Session — nothing was spilled to this disk. */
+  blobRef: string | null;
+  /** The entry the payload belongs to, for the remote read. */
+  rowId: string;
+  part: PayloadPart;
   onLoaded: (text: string) => void;
 }) {
+  const remote = useContext(RemoteSourceContext);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -2343,10 +2781,14 @@ function ShowFull({
     setBusy(true);
     setError(null);
     try {
-      const payload = await invoke<ArtifactPayload>("artifacts_payload", {
-        projectPath,
-        blobRef,
-      });
+      const payload = blobRef
+        ? await invoke<ArtifactPayload>("artifacts_payload", { projectPath, blobRef })
+        : await invoke<ArtifactPayload>("artifacts_cloud_payload", {
+            projectId: remote?.projectId,
+            sessionId: remote?.sessionId,
+            rowId,
+            part,
+          });
       if (payload.text !== null) onLoaded(payload.text);
       else setError("The full payload is binary and cannot be shown.");
     } catch {
@@ -2357,14 +2799,14 @@ function ShowFull({
   };
 
   if (error) {
-    return <span className="ml-1.5 text-[11px] text-[var(--text-tertiary)]">{error}</span>;
+    return <span className="ml-1.5 text-xs text-[var(--muted-foreground)]">{error}</span>;
   }
   return (
     <button
       type="button"
       disabled={busy}
       onClick={() => void fetchFull()}
-      className="ml-1.5 inline-flex cursor-pointer items-center gap-1 text-[11px] text-[var(--text-secondary)] underline underline-offset-2 transition-colors hover:no-underline hover:text-[var(--text-primary)] disabled:opacity-60"
+      className="ml-1.5 inline-flex cursor-pointer items-center gap-1 text-xs text-[var(--secondary-foreground)] underline underline-offset-2 transition-colors hover:no-underline hover:text-[var(--foreground)] disabled:opacity-60"
     >
       {busy && <Loader2 size={10} className="animate-spin" />}
       Show full
@@ -2374,15 +2816,26 @@ function ShowFull({
 
 function Empty({
   detail,
+  pending,
   failedOnly,
   failedCount,
 }: {
   detail: Detail;
+  /** The timeline has not arrived yet — say so rather than claiming it is empty. */
+  pending: boolean;
   failedOnly: boolean;
   failedCount: number;
 }) {
+  if (pending) {
+    return (
+      <p className="flex items-center justify-center gap-2 py-16 text-center text-sm text-[var(--muted-foreground)]">
+        <Loader2 size={12} className="animate-spin" />
+        Loading the timeline…
+      </p>
+    );
+  }
   return (
-    <p className="py-16 text-center text-[12px] text-[var(--text-tertiary)]">
+    <p className="py-16 text-center text-sm text-[var(--muted-foreground)]">
       {detail.entries.length === 0
         ? "Nothing was recorded in this session."
         : failedOnly && failedCount === 0

@@ -1,13 +1,14 @@
 /**
- * Terminal notifications: what to say, where to say it, and when to stay quiet.
+ * Terminal notifications: the terminal's source adapter onto the shared
+ * notification pipeline (`@/features/notifications/lib`).
  *
  * Input is the parser's typed event stream (`TerminalEvent`), tagged with the
- * terminal's identity. Output is up to four channels — the in-app notification
- * center, a toast, a native macOS notification, a chime — chosen by a PURE
- * decision function (`decideTerminalNotification`) that is unit-tested on its
- * own. Everything with a side effect sits in `deliver()`.
+ * terminal's identity. `decideTerminalNotification` (pure, in
+ * `terminal-notifier-rules.ts`) classifies it into a catalog kind and lets the
+ * shared decision pick the channels — center, toast, OS banner, badge, sound;
+ * `deliverNotification` performs them.
  *
- * Rules (defaults from Settings; see `terminalNotificationPrefs`):
+ * Rules (defaults from Settings; see `prefsFromSettings`):
  *  - a command that exits non-zero → "failed", always (unless Ctrl-C);
  *  - a command that ran ≥ `minDurationMs` → "done";
  *  - a password prompt, a bell, or an OSC 9/777 message → "attention", which
@@ -15,42 +16,32 @@
  *    finishes or the user types into it;
  *  - a command that took the alternate screen (vim, htop) is a session, not a
  *    long command — never "done".
- * Suppression: nothing is shown when the terminal is on screen, the window is
+ * OS banners fire only when the user is away (window unfocused, or focused
+ * and idle for 2 minutes). Suppression: nothing is shown when the terminal is on screen, the window is
  * focused and the user has interacted within the last 30 s — they are looking
  * at it. Failures and attention still land in the center as a record.
  *
- * Organisation-wide: every item carries the owning workspace and organisation,
+ * Organisation-wide: every item carries the owning project and organisation,
  * so the center and the bell filter by the active org and a click can route to
- * the exact pane across workspaces (`jumpToTerminal`).
+ * the exact pane across projects (`jumpToTerminal`).
  */
-import { toast } from "sonner";
 import { create } from "zustand";
-import { useNotificationsStore } from "@/features/notifications/stores/notifications-store";
+import { deliverNotification } from "@/features/notifications/lib/deliver";
+import { computeAway, type NotificationEnv } from "@/features/notifications/lib/decide";
 import { useLayoutStore } from "@/features/layout/stores/layout-store";
-import { useWorkspaceStore } from "@/features/workspaces/stores/workspace-store";
-import { useProjectStore } from "@/features/project/stores/project-store";
-import { workspaceIdForTab } from "@/features/chat/lib/tab-workspace";
-import { terminalNotificationPrefs } from "@/features/settings/lib/app-settings";
+import { useProjectStore } from "@/features/projects/stores/project-store";
+import { projectIdForTab } from "@/features/chat/lib/tab-project";
+import { useSettingsStore } from "@/features/settings/stores/settings-store";
 import { isWindowFocused, lastInteraction } from "@/lib/window-focus";
-import { sendNativeNotification } from "@/lib/native-notify";
-import { playChime } from "@/lib/chime";
-import { setDockBadge } from "@/lib/dock-badge";
 import type { TerminalEvent, TerminalEventSink } from "./block-parser";
 import { collectPanes, findTerminal, useTerminalStore } from "../stores/terminal-store";
-import { jumpToTerminal } from "./jump-to-terminal";
+import { decideTerminalNotification, type TerminalCtx } from "./terminal-notifier-rules";
 
 export {
+  classifyTerminalEvent,
   decideTerminalNotification,
-  type Decision,
-  type NotifierEnv,
   type TerminalCtx,
   type TerminalNotificationKind,
-} from "./terminal-notifier-rules";
-import {
-  decideTerminalNotification,
-  type Decision,
-  type NotifierEnv,
-  type TerminalCtx,
 } from "./terminal-notifier-rules";
 
 // ── Live attention state (drives the bell's pulsing dot) ───────────────────
@@ -78,21 +69,17 @@ export const useTerminalAttention = create<AttentionState>((set) => ({
   },
 }));
 
-/** Any terminal, any workspace, waiting on the user. */
+/** Any terminal, any project, waiting on the user. */
 export const anyTerminalNeedsAttention = (s: AttentionState) => Object.keys(s.attention).length > 0;
 
 // ── Environment ────────────────────────────────────────────────────────────
 
-/** On screen = owning workspace is active AND the tab is the active tab of its
+/** On screen = owning project is active AND the tab is the active tab of its
  *  column AND the terminal is the active one in its pane. Every pane of a
  *  split counts as visible. */
-export function isTerminalVisible(
-  tabId: string,
-  terminalId: string,
-  workspaceId?: string,
-): boolean {
-  const ws = useWorkspaceStore.getState();
-  if (workspaceId && workspaceId !== ws.activeWorkspaceId) return false;
+export function isTerminalVisible(tabId: string, terminalId: string, projectId?: string): boolean {
+  const ws = useProjectStore.getState();
+  if (projectId && projectId !== ws.activeProjectId) return false;
   const layout = useLayoutStore.getState();
   const tab = layout.tabs.find((t) => t.id === tabId);
   if (!tab) return false;
@@ -108,17 +95,14 @@ export function isTerminalVisible(
 
 // ── Sink + delivery ────────────────────────────────────────────────────────
 
-/** Bounded memory of what has already been announced. */
-const announced = new Set<string>();
-const ANNOUNCED_CAP = 500;
 /** One bell per terminal per 2 s. */
 const lastBell = new Map<string, number>();
 const BELL_INTERVAL_MS = 2_000;
 
 /**
- * Build the parser's event sink for one terminal. Resolves the workspace and
+ * Build the parser's event sink for one terminal. Resolves the project and
  * organisation at EVENT time — the tab may not have been committed to a
- * workspace view when the parser was constructed.
+ * project view when the parser was constructed.
  */
 export function createTerminalEventSink(base: {
   terminalId: string;
@@ -147,76 +131,27 @@ function handleEvent(e: TerminalEvent, base: { terminalId: string; tabId: string
     useTerminalAttention.getState().actions.set(base.terminalId, e.kind);
   }
 
-  const prefs = terminalNotificationPrefs(useProjectStore.getState().settings);
-  if (!prefs.enabled) return;
+  const { settings } = useSettingsStore.getState();
+  if (!settings.notificationsEnabled) return;
 
-  const ws = useWorkspaceStore.getState();
-  const workspaceId = workspaceIdForTab(base.tabId) ?? undefined;
-  const workspace = workspaceId ? ws.workspaces.find((w) => w.id === workspaceId) : undefined;
+  const ws = useProjectStore.getState();
+  const projectId = projectIdForTab(base.tabId) ?? undefined;
+  const project = projectId ? ws.projects.find((w) => w.id === projectId) : undefined;
   const ctx: TerminalCtx = {
     ...base,
-    workspaceId,
-    workspaceName: workspace?.name,
-    orgId: workspace?.orgId,
+    projectId,
+    projectName: project?.name,
+    orgId: project?.orgId,
   };
-  const env: NotifierEnv = {
-    terminalVisible: isTerminalVisible(base.tabId, base.terminalId, workspaceId),
-    windowFocused: isWindowFocused(),
-    interactedWithinMs: Date.now() - lastInteraction(),
-    workspaceActive: !workspaceId || workspaceId === ws.activeWorkspaceId,
+  const windowFocused = isWindowFocused();
+  const sinceInputMs = Date.now() - lastInteraction();
+  const env: NotificationEnv = {
+    targetVisible: isTerminalVisible(base.tabId, base.terminalId, projectId),
+    windowFocused,
+    sinceInputMs,
+    projectActive: !projectId || projectId === ws.activeProjectId,
+    away: computeAway(windowFocused, sinceInputMs),
   };
-  const decision = decideTerminalNotification(e, ctx, env, prefs);
-  if (!decision) return;
-  if (announced.has(decision.dedupeKey)) return;
-  announced.add(decision.dedupeKey);
-  if (announced.size > ANNOUNCED_CAP) {
-    const first = announced.values().next().value;
-    if (first) announced.delete(first);
-  }
-  deliver(decision, ctx);
-}
-
-function deliver(d: Decision, ctx: TerminalCtx): void {
-  if (d.channels.store) {
-    useNotificationsStore.getState().actions.add({
-      kind: d.kind,
-      source: "terminal",
-      title: d.title,
-      body: d.body,
-      tabId: ctx.tabId,
-      terminalId: ctx.terminalId,
-      workspaceId: ctx.workspaceId,
-      orgId: ctx.orgId,
-    });
-    if (!isWindowFocused()) {
-      const unread = useNotificationsStore.getState().items.filter((i) => !i.read).length;
-      setDockBadge(unread);
-    }
-  }
-  if (d.channels.toast) {
-    const open = () =>
-      void jumpToTerminal({
-        tabId: ctx.tabId,
-        terminalId: ctx.terminalId,
-        workspaceId: ctx.workspaceId,
-      });
-    const opts = {
-      id: `bg-terminal-${d.dedupeKey}`,
-      description: d.body,
-      duration: d.persistMs,
-      action: { label: "Open", onClick: open },
-    };
-    if (d.kind === "terminal-failed") toast.error(d.title, opts);
-    else if (d.kind === "terminal-done") toast.success(d.title, opts);
-    else toast(d.title, opts);
-  }
-  if (d.channels.native) {
-    void sendNativeNotification({
-      title: `Atlas: ${ctx.workspaceName ?? "Terminal"}`,
-      body: `${d.title} — ${d.body}`,
-      sound: d.channels.sound ? "Ping" : undefined,
-    });
-  } else if (d.channels.sound) {
-    playChime();
-  }
+  const decision = decideTerminalNotification(e, ctx, env, settings);
+  if (decision) deliverNotification(decision);
 }

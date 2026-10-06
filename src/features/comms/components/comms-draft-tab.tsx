@@ -22,15 +22,17 @@ export function CommsDraftTab({ convId, draftId }: { convId: string; draftId: st
 
   if (!conv || !draft) {
     return (
-      <div className="flex h-full items-center justify-center text-[11.5px] text-text-tertiary">
+      <div className="flex h-full items-center justify-center text-sm text-muted-foreground">
         This draft is no longer available.
       </div>
     );
   }
 
   return (
-    <div className="flex h-full flex-col bg-[var(--bg-surface)]">
-      <DraftEditor conv={conv} draft={draft} />
+    <div className="flex h-full flex-col bg-[var(--background)]">
+      {/* Keyed by draft: the editor's session (its Y.Doc, the socket relay,
+          `ready`) belongs to ONE draft and is not rebuilt when the prop changes. */}
+      <DraftEditor key={draft.id} conv={conv} draft={draft} />
     </div>
   );
 }

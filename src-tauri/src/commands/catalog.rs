@@ -76,7 +76,7 @@ pub struct AgentCatalogEntry {
     pub name: String,
     pub description: Option<String>,
     pub version: Option<String>,
-    /// "native" (Cersei) | "external" (everything else). The old "builtin"
+    /// "native" (Atlas Agent) | "external" (everything else). The old "builtin"
     /// value is never emitted: Atlas ships no first-party external agents.
     pub kind: String,
     /// See the [`source`] module.
@@ -89,7 +89,7 @@ pub struct AgentCatalogEntry {
     pub installed: bool,
     pub supports_modes: bool,
     pub supports_models: bool,
-    /// "none" | "claude_jsonl" | "cersei_json".
+    /// "none" | "claude_jsonl" | "native".
     pub transcript: String,
     pub login: Option<LoginSpec>,
     /// Auth-method kinds this agent advertised at `initialize` — `"agent"`,
@@ -160,7 +160,7 @@ fn build(host: &AgentHost) -> AgentCatalog {
         .into_iter()
         .map(|plugin| {
             let id = plugin.plugin_id;
-            let is_native = plugin.transcript == TranscriptKind::CerseiJson && !plugin.external;
+            let is_native = plugin.transcript == TranscriptKind::Native && !plugin.external;
             let market = market(&id);
             let capabilities = host.capabilities(&id);
             let agent_id = atlas_acp_thread::AgentId::new(id.as_str());
@@ -223,8 +223,12 @@ fn build(host: &AgentHost) -> AgentCatalog {
                         .or_else(|| agent.website())
                         .map(str::to_string)
                 }),
-                repository: market.as_ref().and_then(|a| a.repository().map(str::to_string)),
-                website: market.as_ref().and_then(|a| a.website().map(str::to_string)),
+                repository: market
+                    .as_ref()
+                    .and_then(|a| a.repository().map(str::to_string)),
+                website: market
+                    .as_ref()
+                    .and_then(|a| a.website().map(str::to_string)),
                 platform_supported: is_native
                     || market
                         .as_ref()
@@ -275,9 +279,15 @@ fn build(host: &AgentHost) -> AgentCatalog {
             supports_fork: false,
             supports_rewind: false,
             icon_data_url: market.as_ref().and_then(super::agent_host::icon_data_url),
-            help_url: market.as_ref().and_then(|a| a.repository().map(str::to_string)),
-            repository: market.as_ref().and_then(|a| a.repository().map(str::to_string)),
-            website: market.as_ref().and_then(|a| a.website().map(str::to_string)),
+            help_url: market
+                .as_ref()
+                .and_then(|a| a.repository().map(str::to_string)),
+            repository: market
+                .as_ref()
+                .and_then(|a| a.repository().map(str::to_string)),
+            website: market
+                .as_ref()
+                .and_then(|a| a.website().map(str::to_string)),
             // Demonstrably runnable on this machine: the binary is right there.
             platform_supported: true,
             distribution_kind: String::new(),
@@ -308,7 +318,7 @@ fn agent_type_for(plugin_id: &str) -> String {
 fn transcript_token(kind: TranscriptKind) -> &'static str {
     match kind {
         TranscriptKind::None => "none",
-        TranscriptKind::CerseiJson => "cersei_json",
+        TranscriptKind::Native => "native",
     }
 }
 
@@ -369,11 +379,11 @@ mod tests {
         // Fresh profile: the native agent, and nothing else. No builtin table,
         // no auto-acquire, nothing pre-seeded (ADR-0002).
         let fresh = build(&host);
-        assert_eq!(ids(&fresh), [atlas_native_agent::CERSEI_AGENT_ID]);
-        let native = entry(&fresh, atlas_native_agent::CERSEI_AGENT_ID);
+        assert_eq!(ids(&fresh), [atlas_native_agent::ATLAS_AGENT_ID]);
+        let native = entry(&fresh, atlas_native_agent::ATLAS_AGENT_ID);
         assert_eq!(native.kind, "native");
         assert_eq!(native.source, source::IN_PROCESS);
-        assert_eq!(native.transcript, "cersei_json");
+        assert_eq!(native.transcript, "native");
 
         // Installing is writing one map entry.
         let mut settings = AllAgentServersSettings::default();
@@ -404,7 +414,7 @@ mod tests {
         host.store()
             .set_settings(AllAgentServersSettings::default())
             .await;
-        assert_eq!(ids(&build(&host)), [atlas_native_agent::CERSEI_AGENT_ID]);
+        assert_eq!(ids(&build(&host)), [atlas_native_agent::ATLAS_AGENT_ID]);
         assert!(host.agent_for("some-agent").is_err());
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -478,7 +488,7 @@ mod tests {
     #[test]
     fn only_claude_has_a_display_alias() {
         assert_eq!(agent_type_for("claude-code-ts"), "claude-code");
-        for id in ["codex", "cersei", "some-agent"] {
+        for id in ["codex", "atlas-agent", "some-agent"] {
             assert_eq!(agent_type_for(id), id);
         }
     }

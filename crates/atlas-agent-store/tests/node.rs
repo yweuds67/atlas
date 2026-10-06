@@ -8,9 +8,7 @@
 
 use std::path::Path;
 
-use atlas_agent_store::node::{
-    bounded_npm_package_spec, npm_command_env, read_package_executable,
-};
+use atlas_agent_store::node::{bounded_npm_package_spec, npm_command_env, read_package_executable};
 use atlas_agent_store::NodeRuntime;
 
 mod fake_http;
@@ -54,7 +52,9 @@ async fn reads_a_string_bin_field() {
     package(dir.path(), "some-cli", r#"{"bin": "./dist/cli.js"}"#);
 
     assert_eq!(
-        read_package_executable(dir.path(), "some-cli").await.unwrap(),
+        read_package_executable(dir.path(), "some-cli")
+            .await
+            .unwrap(),
         dir.path().join("some-cli/./dist/cli.js")
     );
 }
@@ -65,7 +65,9 @@ async fn reads_a_named_bin_field() {
     // One entry: its name does not have to match the package.
     package(dir.path(), "some-cli", r#"{"bin": {"whatever": "cli.js"}}"#);
     assert_eq!(
-        read_package_executable(dir.path(), "some-cli").await.unwrap(),
+        read_package_executable(dir.path(), "some-cli")
+            .await
+            .unwrap(),
         dir.path().join("some-cli/cli.js")
     );
 
@@ -87,16 +89,22 @@ async fn reads_a_named_bin_field() {
 async fn a_package_with_no_executable_is_an_error() {
     let dir = tempfile::tempdir().unwrap();
     package(dir.path(), "some-cli", r#"{"name": "some-cli"}"#);
-    assert!(read_package_executable(dir.path(), "some-cli").await.is_err());
+    assert!(read_package_executable(dir.path(), "some-cli")
+        .await
+        .is_err());
 
     package(
         dir.path(),
         "other-cli",
         r#"{"bin": {"a": "a.js", "b": "b.js"}}"#,
     );
-    assert!(read_package_executable(dir.path(), "other-cli").await.is_err());
+    assert!(read_package_executable(dir.path(), "other-cli")
+        .await
+        .is_err());
 
-    assert!(read_package_executable(dir.path(), "missing").await.is_err());
+    assert!(read_package_executable(dir.path(), "missing")
+        .await
+        .is_err());
 }
 
 /// The managed Node has to win the `PATH` race: a package that shells out to
@@ -108,6 +116,20 @@ fn puts_the_managed_node_first_on_path() {
     assert!(
         path.starts_with("/opt/atlas/node/bin"),
         "managed node must come first, got {path}"
+    );
+}
+
+/// Node resolves `node` off this `PATH` for npm's scripts and the agent's own
+/// children, and rejects the `\\?\`-verbatim spelling (#277). Windows only:
+/// POSIX `join_paths` refuses an entry containing `:`, which `C:` does.
+#[cfg(windows)]
+#[test]
+fn the_managed_node_goes_on_path_in_its_plain_spelling() {
+    let env = npm_command_env(Path::new(r"\\?\C:\atlas\node\node-v24\node.exe"));
+    let path = env.get("PATH").expect("PATH is always set");
+    assert!(
+        path.starts_with(r"C:\atlas\node\node-v24;"),
+        "managed node must come first, plainly spelled, got {path}"
     );
 }
 

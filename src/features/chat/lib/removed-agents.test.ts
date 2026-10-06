@@ -2,8 +2,18 @@
 //
 // `removed-agents` pulls in the chat store, which touches `window` at import.
 
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import type { AgentCatalogEntry } from "@/types/agent-catalog";
+
+// This pure helper currently shares a module with the catalog watcher, which
+// imports the chat/project stores. Their module setup subscribes to config
+// events, so provide the real Tauri boundary shape rather than letting the
+// browser shim reject asynchronously after otherwise-passing assertions.
+vi.mock("@tauri-apps/api/event", () => ({
+  listen: vi.fn(async () => () => {}),
+  emit: vi.fn(async () => {}),
+}));
+
 import { uninstalledBetween } from "./removed-agents";
 
 function entry(id: string, installed: boolean, kind = "external"): AgentCatalogEntry {
@@ -14,8 +24,8 @@ describe("uninstalledBetween", () => {
   it("names an external that was installed and no longer is", () => {
     expect(
       uninstalledBetween(
-        [entry("cersei", true, "native"), entry("claude-acp", true), entry("codex-acp", true)],
-        [entry("cersei", true, "native"), entry("codex-acp", true)],
+        [entry("atlas-agent", true, "native"), entry("claude-acp", true), entry("codex-acp", true)],
+        [entry("atlas-agent", true, "native"), entry("codex-acp", true)],
       ),
     ).toEqual(["claude-acp"]);
   });
@@ -40,7 +50,7 @@ describe("uninstalledBetween", () => {
   it("never reads the first hydrate as a mass uninstall", () => {
     // Pre-hydration the catalog is empty; the native agent alone is not a
     // removal either.
-    expect(uninstalledBetween([], [entry("cersei", true, "native")])).toEqual([]);
-    expect(uninstalledBetween([entry("cersei", true, "native")], [])).toEqual([]);
+    expect(uninstalledBetween([], [entry("atlas-agent", true, "native")])).toEqual([]);
+    expect(uninstalledBetween([entry("atlas-agent", true, "native")], [])).toEqual([]);
   });
 });

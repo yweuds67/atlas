@@ -6,13 +6,27 @@ import { listen } from "@tauri-apps/api/event";
 import { logEvent } from "@/features/log/lib/log";
 import type { GitErrorPayload } from "../lib/git-errors";
 
+/** Background-fetch outcome for one project (`atlas:git-autofetch`). */
+export interface AutoFetchStatus {
+  project: string;
+  /** Epoch ms of the last successful fetch this session. */
+  lastFetchedAt: number | null;
+  /** Why the latest automatic fetch failed; null once one succeeds. */
+  lastError: string | null;
+  /** Commits the current branch is behind its upstream, measured right after
+   *  a successful automatic fetch; absent on every other status. */
+  behind?: number | null;
+  /** The upstream head at that moment (see `behind`). */
+  remoteHead?: string | null;
+}
+
 export interface GitFileStatus {
   path: string;
   status: string;
   staged: boolean;
 }
 
-interface GitLogEntry {
+export interface GitLogEntry {
   hash: string;
   short_hash: string;
   message: string;
@@ -20,7 +34,7 @@ interface GitLogEntry {
   date: string;
 }
 
-interface GitBranch {
+export interface GitBranch {
   name: string;
   is_current: boolean;
 }
@@ -79,7 +93,7 @@ export interface InProgress {
 /** Wire shape of the Rust `git_snapshot` command — everything the panel
  *  headers need in one IPC call (~4 concurrent spawns Rust-side, coalesced
  *  across concurrent callers). */
-interface GitSnapshotWire {
+export interface GitSnapshotWire {
   isRepo: boolean;
   branch: string;
   detached: boolean;
@@ -110,7 +124,7 @@ export interface ActiveGitOp {
   error: GitErrorPayload | null;
 }
 
-type GitOpEvent = {
+export type GitOpEvent = {
   opId: string;
   repo: string;
   kind: string;
@@ -185,6 +199,14 @@ function ensureGitStatusFreshListener(): void {
     });
   });
 
+  // Background auto-fetch outcomes (Rust `git_autofetch`). Keyed by project,
+  // so a status that lands before `repoPath` catches up isn't lost.
+  void listen<AutoFetchStatus>("atlas:git-autofetch", (e) => {
+    useGitStore.setState((s) => {
+      s.autoFetch[e.payload.project] = e.payload;
+    });
+  });
+
   // Live updates from the git watcher — commit / checkout / branch / fetch /
   // stage / push all fire `atlas:git-changed`. One snapshot call covers
   // status, branches, ahead/behind, stashes and in-progress state (the old
@@ -248,16 +270,16 @@ function ensureGitStatusFreshListener(): void {
     });
   });
 
-  // Workspace edits Atlas didn't originate (terminal git, external editor).
+  // Project edits Atlas didn't originate (terminal git, external editor).
   // Editor saves inside Atlas refresh directly (see editor-panel) and don't
   // depend on this. Short debounce just coalesces fs-event bursts.
-  let workspaceDebounce: ReturnType<typeof setTimeout> | null = null;
+  let projectDebounce: ReturnType<typeof setTimeout> | null = null;
   void listen("atlas:explorer:changed", () => {
     const current = useGitStore.getState().repoPath;
     if (!current) return;
-    if (workspaceDebounce) clearTimeout(workspaceDebounce);
-    workspaceDebounce = setTimeout(() => {
-      workspaceDebounce = null;
+    if (projectDebounce) clearTimeout(projectDebounce);
+    projectDebounce = setTimeout(() => {
+      projectDebounce = null;
       const repoPath = useGitStore.getState().repoPath;
       if (!repoPath) return;
       const actions = useGitStore.getState().actions;
@@ -288,6 +310,8 @@ interface GitState {
   activeOp: ActiveGitOp | null;
   /** Typed git error currently shown in the error dialog. */
   errorDialog: GitErrorPayload | null;
+  /** Background-fetch status per project path. */
+  autoFetch: Record<string, AutoFetchStatus>;
 }
 
 interface GitActions {
@@ -341,6 +365,9 @@ interface GitActions {
       coAuthors?: string[],
     ) => Promise<void>;
     fetch: () => Promise<void>;
+    /** Tell the auto-fetch scheduler which project this window shows (null:
+     *  none). Fetches it if due and seeds its status. */
+    setAutoFetchProject: (path: string | null) => Promise<void>;
     pull: (rebase: boolean) => Promise<void>;
     push: (forceWithLease?: boolean, followTags?: boolean) => Promise<void>;
     publishBranch: () => Promise<void>;
@@ -386,6 +413,7 @@ export const useGitStore = createSelectors(
         inProgress: null,
         activeOp: null,
         errorDialog: null,
+        autoFetch: {},
         actions: {
           loadStatus: async (path) => {
             ensureGitStatusFreshListener();
@@ -690,6 +718,16 @@ export const useGitStore = createSelectors(
             const p = repo();
             if (!p) return;
             await invoke("git_fetch", { path: p, opId: newOpId() });
+          },
+          setAutoFetchProject: async (path) => {
+            ensureGitStatusFreshListener();
+            const status = await invoke<AutoFetchStatus | null>("git_autofetch_set_active", {
+              projectPath: path,
+            });
+            if (!status) return;
+            set((s) => {
+              s.autoFetch[status.project] = status;
+            });
           },
           pull: async (rebase) => {
             const p = repo();

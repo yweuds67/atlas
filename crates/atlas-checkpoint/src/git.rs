@@ -10,7 +10,7 @@
 //! Nothing in this module writes. No hooks are installed, no refs are created,
 //! no config is touched. The repository is observed and never modified.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Where a path stood in a commit, relative to its first parent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -206,18 +206,85 @@ pub fn worktree_changes(repo: &Path) -> Option<std::collections::BTreeSet<String
 pub fn changed_between(repo: &Path, from: &str, to: &str) -> Option<Vec<ChangedPath>> {
     let out = run(
         repo,
-        &["diff", "--name-status", "-z", "-M", &format!("{from}..{to}")],
+        &[
+            "diff",
+            "--name-status",
+            "-z",
+            "-M",
+            &format!("{from}..{to}"),
+        ],
     )
     .ok()?;
     Some(parse_name_status(&out))
 }
 
+/// The scope root of shared memory for `dir`: the repository's **main
+/// worktree** (found through the git common dir, so every linked worktree and
+/// every subdirectory of the repository resolves to the same place), or `dir`
+/// itself when it is not inside a git repository.
+///
+/// A bare repository has no main worktree: its worktrees resolve to the bare
+/// repository directory. A submodule or separated git dir resolves to the top
+/// level of the checkout `dir` is in.
+pub fn scope_root(dir: &Path) -> PathBuf {
+    main_worktree(dir).unwrap_or_else(|| dir.to_path_buf())
+}
+
+/// The main worktree of the repository containing `dir`, or `None` outside
+/// git. See [`scope_root`].
+pub fn main_worktree(dir: &Path) -> Option<PathBuf> {
+    let out = run(dir, &["rev-parse", "--git-common-dir"]).ok()?;
+    let common = PathBuf::from(out.trim());
+    // Relative output is relative to `dir` (`git -C dir`).
+    let common = if common.is_absolute() {
+        common
+    } else {
+        dir.join(common)
+    };
+    let common = common.canonicalize().ok()?;
+    if common.file_name().is_some_and(|n| n == ".git") {
+        return common.parent().map(Path::to_path_buf);
+    }
+    // A bare repository's worktrees share no main worktree; the repository
+    // itself is what they have in common.
+    if run(&common, &["rev-parse", "--is-bare-repository"]).is_ok_and(|o| o.trim() == "true") {
+        return Some(common);
+    }
+    let top = run(dir, &["rev-parse", "--show-toplevel"]).ok()?;
+    let top = top.trim();
+    (!top.is_empty()).then(|| PathBuf::from(top))
+}
+
+/// Every worktree of the repository containing `dir` (main first, as git
+/// lists them). Empty outside git.
+pub fn worktree_paths(dir: &Path) -> Vec<PathBuf> {
+    let Ok(out) = run(dir, &["worktree", "list", "--porcelain"]) else {
+        return Vec::new();
+    };
+    out.lines()
+        .filter_map(|l| l.strip_prefix("worktree "))
+        .map(PathBuf::from)
+        .collect()
+}
+
 /// Is this directory a git repository?
 ///
-/// Git is optional: a Workspace that is not a repository captures Sessions
+/// Git is optional: a Project that is not a repository captures Sessions
 /// perfectly well and simply never produces Checkpoints.
 pub fn is_repository(repo: &Path) -> bool {
     repo.join(".git").exists() && run(repo, &["rev-parse", "--git-dir"]).is_ok()
+}
+
+/// Git's empty tree — the "before" of a repository's first commit.
+pub const EMPTY_TREE: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
+
+/// Whether HEAD is an unborn branch: a repository whose current branch has no
+/// commit yet. Distinguishes a fresh `git init` from a `head_commit` that
+/// failed for some other reason — only the first says every commit that
+/// appears later is new.
+pub fn is_unborn(repo: &Path) -> bool {
+    run(repo, &["symbolic-ref", "-q", "HEAD"]).is_ok()
+        && run(repo, &["rev-parse", "-q", "--verify", "HEAD"]).is_err()
 }
 
 /// The commit HEAD points at, or `None` for an unborn branch (a fresh `git init`
@@ -259,7 +326,10 @@ pub fn is_reachable(repo: &Path, sha: &str) -> Result<bool> {
     }
 
     // `for-each-ref --contains` covers every ref — branches, tags, remotes.
-    let refs = run_status(repo, &["for-each-ref", "--format=%(refname)", "--contains", sha])?;
+    let refs = run_status(
+        repo,
+        &["for-each-ref", "--format=%(refname)", "--contains", sha],
+    )?;
     if refs.success {
         return Ok(!refs.stdout.trim().is_empty());
     }
@@ -290,7 +360,12 @@ pub fn commits_between(repo: &Path, from: Option<&str>, to: &str) -> Result<Vec<
         None => to.to_string(),
     };
     let out = run(repo, &["rev-list", "--first-parent", "--reverse", &range])?;
-    Ok(out.lines().map(str::trim).filter(|l| !l.is_empty()).map(str::to_string).collect())
+    Ok(out
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(str::to_string)
+        .collect())
 }
 
 /// The most recent `limit` commits from HEAD, oldest first.
@@ -298,14 +373,26 @@ pub fn commits_between(repo: &Path, from: Option<&str>, to: &str) -> Result<Vec<
 /// The recovery path for a cursor that can no longer be resolved — garbage
 /// collected, or rewritten away. `rev-list from..HEAD` fails outright in that
 /// case, after which detection would silently stop forever, so a bounded
-/// re-scan is what keeps a Workspace from going quietly dark. Re-processing is
+/// re-scan is what keeps a Project from going quietly dark. Re-processing is
 /// harmless because `(Session, commit)` is the idempotency key.
 pub fn recent_commits(repo: &Path, limit: usize) -> Result<Vec<String>> {
     let out = run(
         repo,
-        &["rev-list", "--first-parent", "--reverse", "--max-count", &limit.to_string(), "HEAD"],
+        &[
+            "rev-list",
+            "--first-parent",
+            "--reverse",
+            "--max-count",
+            &limit.to_string(),
+            "HEAD",
+        ],
     )?;
-    Ok(out.lines().map(str::trim).filter(|l| !l.is_empty()).map(str::to_string).collect())
+    Ok(out
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(str::to_string)
+        .collect())
 }
 
 /// The repository's root commit — the identity that survives forks, folder
@@ -320,7 +407,11 @@ pub fn root_commit(repo: &Path) -> Option<String> {
     let out = run(repo, &["rev-list", "--max-parents=0", "HEAD"]).ok()?;
     // A repository with several root commits (a merged-in unrelated history)
     // has no single fingerprint. The last is the oldest.
-    out.lines().last().map(str::trim).map(str::to_string).filter(|s| !s.is_empty())
+    out.lines()
+        .last()
+        .map(str::trim)
+        .map(str::to_string)
+        .filter(|s| !s.is_empty())
 }
 
 /// Is this a shallow clone?
@@ -384,7 +475,12 @@ pub fn normalize_git_url(raw: &str) -> String {
 /// for them costs two `stat`s and turns "tolerate firing mid-rebase" from a hope
 /// into a guarantee.
 pub fn rewrite_in_progress(repo: &Path) -> bool {
-    const MARKERS: [&str; 4] = ["rebase-merge", "rebase-apply", "CHERRY_PICK_HEAD", "MERGE_HEAD"];
+    const MARKERS: [&str; 4] = [
+        "rebase-merge",
+        "rebase-apply",
+        "CHERRY_PICK_HEAD",
+        "MERGE_HEAD",
+    ];
 
     // Resolved through `rev-parse --git-path` rather than assuming `.git/<marker>`:
     // in a linked worktree the markers live under the worktree's private gitdir
@@ -395,10 +491,14 @@ pub fn rewrite_in_progress(repo: &Path) -> bool {
         repo,
         &[
             "rev-parse",
-            "--git-path", MARKERS[0],
-            "--git-path", MARKERS[1],
-            "--git-path", MARKERS[2],
-            "--git-path", MARKERS[3],
+            "--git-path",
+            MARKERS[0],
+            "--git-path",
+            MARKERS[1],
+            "--git-path",
+            MARKERS[2],
+            "--git-path",
+            MARKERS[3],
         ],
     ) {
         return out
@@ -431,8 +531,16 @@ pub fn rewrite_in_progress(repo: &Path) -> bool {
 /// would make that collision invisible and the re-match would confidently pick
 /// the one candidate it happened to see.
 pub fn recent_commits_all_refs(repo: &Path, limit: usize) -> Result<Vec<String>> {
-    let out = run(repo, &["rev-list", "--all", "--max-count", &limit.to_string()])?;
-    Ok(out.lines().map(str::trim).filter(|l| !l.is_empty()).map(str::to_string).collect())
+    let out = run(
+        repo,
+        &["rev-list", "--all", "--max-count", &limit.to_string()],
+    )?;
+    Ok(out
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(str::to_string)
+        .collect())
 }
 
 /// Every reachable commit's patch-id, as `patch_id -> [commit, …]`.
@@ -445,7 +553,10 @@ pub fn recent_commits_all_refs(repo: &Path, limit: usize) -> Result<Vec<String>>
 /// Fallible on purpose. A failed scan must not be readable as an *empty* map —
 /// "no candidates" is what reconciliation turns into "no match, orphan", and a
 /// transient git failure must never orphan anything.
-pub fn patch_id_map(repo: &Path, limit: usize) -> Result<std::collections::HashMap<String, Vec<String>>> {
+pub fn patch_id_map(
+    repo: &Path,
+    limit: usize,
+) -> Result<std::collections::HashMap<String, Vec<String>>> {
     let mut map: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
     for commit in recent_commits_all_refs(repo, limit)? {
         // `None` for an empty diff, which is exactly right: the patch-id of an
@@ -474,9 +585,21 @@ pub fn merge_side_commits(
     let range = format!("{first_parent}..{side_parent}");
     let out = run(
         repo,
-        &["rev-list", "--no-merges", "--reverse", "--max-count", &limit.to_string(), &range],
+        &[
+            "rev-list",
+            "--no-merges",
+            "--reverse",
+            "--max-count",
+            &limit.to_string(),
+            &range,
+        ],
     )?;
-    Ok(out.lines().map(str::trim).filter(|l| !l.is_empty()).map(str::to_string).collect())
+    Ok(out
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(str::to_string)
+        .collect())
 }
 
 /// The branches a commit is on.
@@ -484,7 +607,10 @@ pub fn merge_side_commits(
 /// Used to break a patch-id tie: the classic ambiguity is a cherry-pick, where
 /// the same diff is reachable at two commits on two branches.
 pub fn branches_containing(repo: &Path, sha: &str) -> Vec<String> {
-    let Ok(out) = run(repo, &["branch", "--format=%(refname:short)", "--contains", sha]) else {
+    let Ok(out) = run(
+        repo,
+        &["branch", "--format=%(refname:short)", "--contains", sha],
+    ) else {
         return Vec::new();
     };
     out.lines()
@@ -497,7 +623,15 @@ pub fn branches_containing(repo: &Path, sha: &str) -> Vec<String> {
 pub fn commit_info(repo: &Path, sha: &str) -> Result<CommitInfo> {
     // Unit-separator delimited so an author name containing the delimiter is
     // not a parsing hazard.
-    let out = run(repo, &["show", "--no-patch", "--format=%H%x1f%an%x1f%ae%x1f%P%x1f%ct%x1f%s", sha])?;
+    let out = run(
+        repo,
+        &[
+            "show",
+            "--no-patch",
+            "--format=%H%x1f%an%x1f%ae%x1f%P%x1f%ct%x1f%s",
+            sha,
+        ],
+    )?;
     let line = out.lines().next().unwrap_or_default();
     let mut fields = line.split('\x1f');
 
@@ -515,7 +649,10 @@ pub fn commit_info(repo: &Path, sha: &str) -> Result<CommitInfo> {
         // bound then refuses to link this commit to any Session rather than
         // linking it to all of them — a missing link is recoverable, a wrong
         // one corrupts a shared timeline.
-        commit_time: fields.next().and_then(|f| f.trim().parse().ok()).unwrap_or(0),
+        commit_time: fields
+            .next()
+            .and_then(|f| f.trim().parse().ok())
+            .unwrap_or(0),
         subject: fields.next().unwrap_or_default().to_string(),
     })
 }
@@ -592,7 +729,7 @@ pub fn blob_at(repo: &Path, sha: &str, path: &str) -> Option<Vec<u8>> {
     output.status.success().then_some(output.stdout)
 }
 
-/// Whether `HEAD` already tracks this workspace-relative path.
+/// Whether `HEAD` already tracks this project-relative path.
 ///
 /// The fallback answer for `existed_before` when the write-sampling probe
 /// cannot run before the agent's write. A filesystem `exists()` is only
@@ -656,7 +793,9 @@ fn head_tracked_set(repo: &Path) -> Option<std::sync::Arc<std::collections::Hash
     let head_mtime = mtime(git_dir.join("HEAD"))?;
     let index_mtime = mtime(git_dir.join("index"))?;
 
-    let mut cache = CACHE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut cache = CACHE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     if let Some(entry) = cache.get(repo) {
         if entry.head_mtime == head_mtime && entry.index_mtime == index_mtime {
             return Some(entry.paths.clone());
@@ -773,6 +912,12 @@ pub fn patch_id(repo: &Path, sha: &str) -> Option<String> {
     (!id.is_empty()).then(|| id.to_string())
 }
 
+// The integration tests' git helpers, isolated from the global and system
+// config. Reached by path because `tests/` is not part of the library crate.
+#[cfg(test)]
+#[path = "../tests/support/mod.rs"]
+mod test_support;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -787,9 +932,7 @@ mod tests {
         pub fn new() -> Self {
             let dir = tempfile::tempdir().unwrap();
             let repo = Self { dir };
-            repo.git(&["init", "--initial-branch=main"]);
-            repo.git(&["config", "user.name", "Test Developer"]);
-            repo.git(&["config", "user.email", "dev@example.com"]);
+            super::test_support::init_repo(repo.path());
             repo
         }
 
@@ -798,18 +941,7 @@ mod tests {
         }
 
         pub fn git(&self, args: &[&str]) -> String {
-            let output = atlas_process::command("git")
-                .arg("-C")
-                .arg(self.path())
-                .args(args)
-                .output()
-                .expect("git runs");
-            assert!(
-                output.status.success(),
-                "git {args:?} failed: {}",
-                String::from_utf8_lossy(&output.stderr)
-            );
-            String::from_utf8_lossy(&output.stdout).into_owned()
+            super::test_support::git(self.path(), args)
         }
 
         pub fn write(&self, path: &str, content: &str) {
@@ -825,6 +957,103 @@ mod tests {
             self.git(&["commit", "-m", message]);
             head_commit(self.path()).expect("a commit")
         }
+    }
+
+    /// A fresh `git init` is unborn until its first commit, and the empty tree
+    /// diffs against that commit as "everything was added".
+    #[test]
+    fn a_fresh_repository_is_unborn_until_its_first_commit() {
+        let repo = TestRepo::new();
+        assert!(is_unborn(repo.path()));
+        assert_eq!(head_commit(repo.path()), None);
+
+        repo.write("index.html", "<h1>Pulse Board</h1>");
+        let root = repo.commit_all("scaffold");
+        assert!(!is_unborn(repo.path()));
+
+        let changed = changed_between(repo.path(), EMPTY_TREE, &root).expect("diff");
+        assert_eq!(changed.len(), 1);
+        assert_eq!(changed[0].path, "index.html");
+        assert!(!changed[0].kind.existed_in_parent());
+        assert_eq!(
+            commits_between(repo.path(), None, &root).unwrap(),
+            vec![root]
+        );
+    }
+
+    #[test]
+    fn a_directory_that_is_not_a_repository_is_not_unborn() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(!is_unborn(dir.path()));
+    }
+
+    // ── Shared-memory scope ─────────────────────────────────────────────────
+
+    /// Two worktrees of one repository (and a subdirectory of either) are one
+    /// shared-memory scope: the main worktree.
+    #[test]
+    fn two_worktrees_of_one_repository_resolve_to_one_scope() {
+        let repo = TestRepo::new();
+        repo.write("src/lib.rs", "fn main() {}");
+        repo.commit_all("initial");
+        let elsewhere = tempfile::tempdir().unwrap();
+        let linked = elsewhere.path().join("feature");
+        repo.git(&["worktree", "add", "-b", "feature", linked.to_str().unwrap()]);
+
+        let main = repo.path().canonicalize().unwrap();
+        assert_eq!(scope_root(repo.path()), main);
+        assert_eq!(scope_root(&linked), main);
+        assert_eq!(scope_root(&linked.join("src")), main);
+        assert_eq!(scope_root(&repo.path().join("src")), main);
+
+        let listed: Vec<PathBuf> = worktree_paths(&linked)
+            .into_iter()
+            .map(|p| p.canonicalize().unwrap())
+            .collect();
+        assert_eq!(listed, vec![main, linked.canonicalize().unwrap()]);
+    }
+
+    /// Worktrees of a bare repository share the bare repository as their scope.
+    #[test]
+    fn worktrees_of_a_bare_repository_resolve_to_one_scope() {
+        let repo = TestRepo::new();
+        repo.write("a.txt", "a");
+        repo.commit_all("initial");
+        let holder = tempfile::tempdir().unwrap();
+        let bare = holder.path().join("repo.git");
+        repo.git(&[
+            "clone",
+            "--bare",
+            repo.path().to_str().unwrap(),
+            bare.to_str().unwrap(),
+        ]);
+        let one = holder.path().join("one");
+        let two = holder.path().join("two");
+        for (wt, branch) in [(&one, "b1"), (&two, "b2")] {
+            let out = atlas_process::command("git")
+                .arg("-C")
+                .arg(&bare)
+                .args(["worktree", "add", "-b", branch, wt.to_str().unwrap()])
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        let expected = bare.canonicalize().unwrap();
+        assert_eq!(scope_root(&one), expected);
+        assert_eq!(scope_root(&two), expected);
+    }
+
+    /// Outside git the scope is the launch directory itself.
+    #[test]
+    fn a_non_git_directory_resolves_to_itself() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(scope_root(dir.path()), dir.path());
+        assert!(main_worktree(dir.path()).is_none());
+        assert!(worktree_paths(dir.path()).is_empty());
     }
 
     // ── Working-tree snapshots ──────────────────────────────────────────────
@@ -890,7 +1119,9 @@ mod tests {
         repo.commit_all("initial");
         repo.write("my notes.txt", "hello");
 
-        assert!(worktree_changes(repo.path()).unwrap().contains("my notes.txt"));
+        assert!(worktree_changes(repo.path())
+            .unwrap()
+            .contains("my notes.txt"));
     }
 
     /// Not a repository is not an error — it is "no answer", and the caller
@@ -939,8 +1170,12 @@ mod tests {
         let repo = TestRepo::new();
         repo.write("a.txt", "x");
         let head = repo.commit_all("seed");
-        assert!(changed_between(repo.path(), "0000000000000000000000000000000000000000", &head)
-            .is_none());
+        assert!(changed_between(
+            repo.path(),
+            "0000000000000000000000000000000000000000",
+            &head
+        )
+        .is_none());
     }
 
     #[test]
@@ -1238,8 +1473,14 @@ mod tests {
         };
         std::fs::create_dir_all(&marker_path).unwrap();
 
-        assert!(rewrite_in_progress(&wt), "the worktree's own markers must count");
-        assert!(!rewrite_in_progress(repo.path()), "the main worktree is not rebasing");
+        assert!(
+            rewrite_in_progress(&wt),
+            "the worktree's own markers must count"
+        );
+        assert!(
+            !rewrite_in_progress(repo.path()),
+            "the main worktree is not rebasing"
+        );
     }
 
     #[test]
@@ -1328,7 +1569,9 @@ mod tests {
             "the first-parent scan follows only the current branch"
         );
         assert!(
-            recent_commits_all_refs(repo.path(), 50).unwrap().contains(&side),
+            recent_commits_all_refs(repo.path(), 50)
+                .unwrap()
+                .contains(&side),
             "the all-refs scan must see it"
         );
     }
@@ -1398,7 +1641,12 @@ mod tests {
         let repo = TestRepo::new();
         repo.write("a", "1");
         repo.commit_all("initial");
-        repo.git(&["remote", "add", "origin", "git@github.com:tryatlas/atlas.git"]);
+        repo.git(&[
+            "remote",
+            "add",
+            "origin",
+            "git@github.com:tryatlas/atlas.git",
+        ]);
         assert_eq!(
             origin_url(repo.path()).as_deref(),
             Some("github.com/tryatlas/atlas")
